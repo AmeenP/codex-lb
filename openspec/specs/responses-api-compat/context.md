@@ -360,3 +360,7 @@ content. A missing output cannot be filled in by the agent message. The proof
 does not make the payload portable: unavailable-owner fallback and retirement
 cannot move that original body to another account. Account-neutral recovery
 retains its separate eligibility and projection rules.
+
+## Desktop reconnect compatibility
+
+Same-owner proof accepts optional desktop annotations without changing the upstream input. A developer annotation containing content_item_kinds but no turn_id previously rejected a complete full resend and caused stale-anchor injection. Unknown metadata and incomplete tool histories remain rejected; this proof cannot authorize account switching.

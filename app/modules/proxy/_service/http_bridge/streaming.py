@@ -1595,12 +1595,14 @@ class _HTTPBridgeStreamingMixin:
         def replay_projection_retains_required_context(
             replay_projection: AccountNeutralReplayProjection,
             lookup: DurableBridgeLookup,
+            *,
+            same_owner: bool = True,
         ) -> bool:
             return responses_input_suffix_retains_prior_output(
                 replay_projection.input_items,
                 stored_count=replay_projection.stored_prefix_count,
                 canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                allow_same_owner_agent_messages=True,
+                allow_same_owner_agent_messages=same_owner,
             ) or (
                 lookup.latest_pending_tool_calls is not None
                 and responses_input_suffix_matches_pending_tool_calls(
@@ -1608,13 +1610,15 @@ class _HTTPBridgeStreamingMixin:
                     stored_count=replay_projection.stored_prefix_count,
                     pending_tool_calls=lookup.latest_pending_tool_calls,
                     canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                    allow_same_owner_agent_messages=True,
+                    allow_same_owner_agent_messages=same_owner,
                 )
             )
 
         def classify_durable_full_resend(
             lookup: DurableBridgeLookup,
         ) -> tuple[int | None, str | None, bool, _AccountNeutralReplayRejection | None]:
+            nonlocal durable_full_resend_retains_required_context_cache
+            durable_full_resend_retains_required_context_cache = None
             anchor_rejection = _durable_full_resend_anchor_rejection(
                 payload,
                 lookup,
@@ -1634,6 +1638,11 @@ class _HTTPBridgeStreamingMixin:
             )
             safe_fresh_context = False
             if replay_projection is not None:
+                # Same-owner desktop proofs are broader than cross-account
+                # proofs. Never reuse their result as permission to move input.
+                durable_full_resend_retains_required_context_cache = replay_projection_retains_required_context(
+                    replay_projection, lookup, same_owner=False
+                )
                 safe_fresh_context = replay_projection_retains_required_context(replay_projection, lookup)
             return stored_count, lookup.latest_input_full_fingerprint, safe_fresh_context, None
 
@@ -1649,7 +1658,6 @@ class _HTTPBridgeStreamingMixin:
             and durable_full_resend_anchor_count is not None
             and isinstance(payload.input, list)
         ):
-            durable_full_resend_retains_required_context_cache = durable_full_resend_has_safe_fresh_context
             replay_projection = project_responses_input_for_account_neutral_fresh_replay(
                 cast(list[JsonValue], payload.input),
                 stored_count=durable_full_resend_anchor_count,
@@ -1658,9 +1666,9 @@ class _HTTPBridgeStreamingMixin:
                 durable_full_resend_fresh_payload = _http_bridge_payload_without_previous_response_id(
                     payload
                 ).model_copy(update={"input": replay_projection.input_items})
-                durable_full_resend_is_account_neutral = _http_bridge_payload_is_account_neutral_fresh_replay(
-                    durable_full_resend_fresh_payload
-                )
+                durable_full_resend_is_account_neutral = bool(
+                    durable_full_resend_retains_required_context_cache
+                ) and _http_bridge_payload_is_account_neutral_fresh_replay(durable_full_resend_fresh_payload)
                 if durable_lookup is not None:
                     try:
                         _fresh_state, fresh_replay_text = prepare_bridge_request(
@@ -2128,6 +2136,7 @@ class _HTTPBridgeStreamingMixin:
                 durable_full_resend_retains_required_context_cache = replay_projection_retains_required_context(
                     eligibility_projection,
                     durable_lookup,
+                    same_owner=False,
                 )
             if not durable_full_resend_retains_required_context_cache:
                 durable_full_resend_context_rejection = "missing_prior_output"
@@ -3796,7 +3805,7 @@ class _HTTPBridgeStreamingMixin:
                 and verified_stale_anchor_operation_fenced
                 and request_state.response_event_count == 0
                 and request_state.replay_count == 0
-                and durable_full_resend_retains_required_context()
+                and durable_full_resend_has_safe_fresh_context
             )
             previous_response_rejected_full_resend = (
                 explicit_previous_response_rejection
@@ -3810,7 +3819,7 @@ class _HTTPBridgeStreamingMixin:
                 and not verified_stale_anchor_operation_fenced
                 and request_state.response_event_count == 0
                 and request_state.replay_count == 0
-                and durable_full_resend_retains_required_context()
+                and durable_full_resend_has_safe_fresh_context
             )
             should_attempt_context_overflow_fresh_turn_recovery = (
                 is_context_overflow
