@@ -3488,3 +3488,41 @@ def test_extract_input_image_file_references_collects_tool_output_paths():
         (0, None, "file_tool"),
         (0, None, "file_nested"),
     ]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_explicit_web_action_adapter_preserves_complete_record(monkeypatch, enabled):
+    from types import SimpleNamespace
+
+    import app.core.openai.requests as requests_module
+
+    monkeypatch.setattr(
+        requests_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            replay_web_action_as_text_ids=["ws_incompatible"] if enabled else [],
+        ),
+    )
+    record = {
+        "type": "web_search_call",
+        "id": "ws_incompatible",
+        "status": "completed",
+        "action": {"type": "open_page", "url": "https://example.com/é"},
+        "internal_chat_message_metadata_passthrough": {"turn_id": "turn_1"},
+    }
+    other = {**record, "id": "ws_other"}
+    pending = {**record, "status": "in_progress"}
+    original = deepcopy([record, other, pending])
+    request = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "Continue.", "input": original})
+    result = request.to_payload()["input"]
+    assert result[1:] == [other, pending]
+    if enabled:
+        import json
+
+        message = result[0]
+        assert message["role"] == "assistant"
+        assert json.loads(message["content"][0]["text"].removeprefix("Historical web action: ")) == record
+    else:
+        assert result[0] == record
+    assert original == [record, other, pending]
+    assert _sanitize_input_items(deepcopy(result)) == result

@@ -9563,6 +9563,7 @@ async def test_backend_responses_verified_full_resend_ignores_stale_broad_owner_
         "owner-unavailable",
         "quarantined-owner-unavailable",
         "fence-unavailable",
+        "desktop-metadata",
     ],
 )
 @pytest.mark.asyncio
@@ -9598,6 +9599,18 @@ async def test_http_bridge_preserves_agent_message_full_resend(
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
     headers = {"x-codex-session-id": "agent-message-conversation"}
     historical_input = [{"role": "user", "content": [{"type": "input_text", "text": "Run the check."}]}]
+    if replay_case == "desktop-metadata":
+        historical_input.insert(0, {"type": "additional_tools", "role": "developer", "tools": []})
+        historical_input.insert(
+            1,
+            {
+                "type": "message",
+                "role": "developer",
+                "id": "msg_control",
+                "content": [{"type": "input_text", "text": "Keep the full context."}],
+                "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["text"]},
+            },
+        )
     first_events = await _collect_sse_events(
         async_client,
         path,
@@ -9654,6 +9667,21 @@ async def test_http_bridge_preserves_agent_message_full_resend(
         "store": False,
         "stream": True,
     }
+    if replay_case == "desktop-metadata":
+        full_resend.insert(
+            -1,
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "The previous check completed."}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn_agent",
+                    "create_time": 1792289792.66,
+                    "content_item_kinds": ["text"],
+                },
+            },
+        )
     if replay_case == "malformed-message":
         full_resend[-1]["id"] = " "
     if replay_case in {"stale-anchor", "after-output", "fence-unavailable"}:
@@ -9700,7 +9728,7 @@ async def test_http_bridge_preserves_agent_message_full_resend(
     assert connected_accounts == [owner.chatgpt_account_id] * (3 if replay_case == "stale-anchor" else 2)
     assert len(rejecting_upstream.sent_text) == (1 if replay_case == "stale-anchor" else 0)
 
-    if replay_case in {"fresh", "stale-anchor"}:
+    if replay_case in {"fresh", "stale-anchor", "desktop-metadata"}:
         # The replacement becomes the owner of subsequent incremental turns;
         # recovery must not keep reusing the response ID from the old socket.
         next_input = [*full_resend, *events[-1]["response"]["output"], {"role": "user", "content": "Continue."}]

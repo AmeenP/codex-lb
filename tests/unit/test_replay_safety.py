@@ -2727,3 +2727,59 @@ def test_account_neutral_replay_marker_requires_tagged_existing_hard_kind() -> N
 def test_account_neutral_replay_marker_rejects_empty_nonce() -> None:
     with pytest.raises(ValueError, match="nonce"):
         make_http_bridge_account_neutral_replay_key("")
+
+
+@pytest.mark.parametrize(
+    "metadata,accepted",
+    [
+        ({"content_item_kinds": ["text"]}, True),
+        ({"turn_id": "turn_1", "create_time": 1792289792.66, "content_item_kinds": ["text"]}, True),
+        ({"turn_id": " "}, False),
+        ({"turn_id": None}, False),
+        ({"create_time": True}, False),
+        ({"create_time": float("inf")}, False),
+        ({"create_time": -1}, False),
+        ({"content_item_kinds": []}, False),
+        ({"content_item_kinds": [3]}, False),
+        ({"unknown_owner": "owner"}, False),
+    ],
+)
+@pytest.mark.parametrize("history", ["assistant", "tool-manifest"])
+def test_desktop_annotations_only_widen_same_owner_proof(metadata, accepted, history):
+    items = [
+        {
+            "type": "message",
+            "role": "developer",
+            "id": "msg_control",
+            "content": "Keep context.",
+            "internal_chat_message_metadata_passthrough": metadata,
+        },
+        {"role": "user", "content": "Check."},
+    ]
+    suffix = (
+        [{"role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}, _agent_followup()]
+        if history == "assistant"
+        else [
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": "pwd"},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "/workspace"},
+            _agent_followup(),
+        ]
+    )
+    items += suffix
+    original = deepcopy(items)
+    for same_owner in (False, True):
+        if history == "assistant":
+            result = responses_input_suffix_retains_prior_output(
+                items,
+                stored_count=2,
+                allow_same_owner_agent_messages=same_owner,
+            )
+        else:
+            result = responses_input_suffix_matches_pending_tool_calls(
+                items,
+                stored_count=2,
+                pending_tool_calls={"call_1": "custom_tool_call"},
+                allow_same_owner_agent_messages=same_owner,
+            )
+        assert result is (same_owner and accepted)
+    assert items == original

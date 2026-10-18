@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from collections.abc import Container, Mapping
 from dataclasses import dataclass
@@ -322,9 +323,15 @@ def responses_input_suffix_retains_prior_output(
 
     if stored_count <= 0 or len(input_items) <= stored_count:
         return False
+    if allow_same_owner_agent_messages:
+        normalized = _same_owner_proof_items(input_items)
+        if normalized is None:
+            return False
+        input_items = normalized
     prefix_state = _direct_tool_call_prefix_state(
         input_items[:stored_count],
         canonical_lite_developer_index=canonical_lite_developer_index,
+        allow_same_owner_messages=allow_same_owner_agent_messages,
     )
     if prefix_state is None:
         return False
@@ -413,20 +420,35 @@ def responses_input_suffix_matches_pending_tool_calls(
 
     if stored_count <= 0 or len(input_items) <= stored_count or not pending_tool_calls:
         return False
+    if allow_same_owner_agent_messages:
+        normalized = _same_owner_proof_items(input_items)
+        if normalized is None:
+            return False
+        input_items = normalized
     prefix_state = _direct_tool_call_prefix_state(
         input_items[:stored_count],
         allow_historical_developer_interleave=True,
         canonical_lite_developer_index=canonical_lite_developer_index,
+        allow_same_owner_messages=allow_same_owner_agent_messages,
     )
     if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
         return False
     suffix = input_items[stored_count:]
     if allow_same_owner_agent_messages:
-        # New subagent input may follow the settled response, but cannot stand
-        # in for a missing call/output or interrupt a parallel call batch. Only
-        # the proof view omits these items; dispatch retains the original body
-        # on its proven owner. Account-neutral checks still reject them.
-        while suffix and _is_same_owner_agent_message(suffix[-1]):
+        # These messages only surround the exact manifest below. They cannot
+        # substitute for a missing result or interrupt a parallel batch.
+        while (
+            suffix
+            and isinstance(suffix[0], dict)
+            and _same_owner_plaintext_message(suffix[0], "assistant")
+            and suffix[0].get("phase") == "commentary"
+        ):
+            suffix = suffix[1:]
+        while suffix and (
+            _is_same_owner_agent_message(suffix[-1])
+            or _same_owner_plaintext_message(suffix[-1], "user")
+            or _same_owner_plaintext_message(suffix[-1], "developer")
+        ):
             suffix.pop()
     if (
         len(suffix) == 3
@@ -455,6 +477,68 @@ def responses_input_suffix_matches_pending_tool_calls(
             suffix_outputs[call_id] = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
     expected = dict(pending_tool_calls)
     return suffix_calls == expected and suffix_outputs == expected
+
+
+def _same_owner_proof_items(input_items: list[JsonValue]) -> list[JsonValue] | None:
+    """Validate desktop annotations in a copy used only to prove same-owner context.
+
+    Never serialize this copy: dispatch retains the original metadata, IDs and
+    encrypted content. Cross-account proof does not use this normalization.
+    """
+    normalized: list[JsonValue] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            return None
+        metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+        if metadata is None:
+            normalized.append(item)
+            continue
+        if not isinstance(metadata, dict) or metadata.keys() - {"turn_id", "create_time", "content_item_kinds"}:
+            return None
+        if "turn_id" in metadata and not _is_nonblank_string(metadata["turn_id"]):
+            return None
+        if "create_time" in metadata:
+            stamp = metadata["create_time"]
+            if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+                return None
+            try:
+                if not math.isfinite(stamp) or stamp <= 0:
+                    return None
+            except OverflowError:
+                return None
+        if "content_item_kinds" in metadata:
+            kinds = metadata["content_item_kinds"]
+            if not isinstance(kinds, list) or not kinds or not all(_is_nonblank_string(kind) for kind in kinds):
+                return None
+        proof_item = {key: value for key, value in item.items() if key != _INTERNAL_CHAT_MESSAGE_METADATA_FIELD}
+        if "turn_id" in metadata:
+            proof_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
+        normalized.append(proof_item)
+    return normalized
+
+
+def _same_owner_plaintext_message(item: JsonValue, role: str) -> bool:
+    """Recognize retained plaintext without granting account portability."""
+    if not isinstance(item, dict) or item.get("role") != role:
+        return False
+    item_type = item.get("type")
+    if item_type is not None and item_type != "message":
+        return False
+    if not (
+        (item.get("id") is None or _is_nonblank_string(item.get("id")))
+        and _input_item_has_only_known_fields(item, cast(str | None, item_type))
+        and _internal_chat_message_metadata_is_account_neutral(item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD))
+        and _message_has_valid_account_neutral_content(item)
+    ):
+        return False
+    content = item.get("content")
+    return isinstance(content, str) or (
+        isinstance(content, list)
+        and all(
+            isinstance(part, dict) and _is_one_of(part.get("type"), {"input_text", "output_text", "text", "refusal"})
+            for part in content
+        )
+    )
 
 
 def _is_same_owner_agent_message(item: JsonValue) -> bool:
@@ -492,6 +576,7 @@ def _direct_tool_call_prefix_state(
     *,
     allow_historical_developer_interleave: bool = False,
     canonical_lite_developer_index: int | None = None,
+    allow_same_owner_messages: bool = False,
 ) -> tuple[deque[tuple[str, str]], set[str]] | None:
     pending_calls: deque[tuple[str, str]] = deque()
     seen_call_ids: set[str] = set()
@@ -508,6 +593,8 @@ def _direct_tool_call_prefix_state(
             return None
         item_type = item_type_value if isinstance(item_type_value, str) else None
         if item.get("role") == "developer" and item_type != "additional_tools":
+            if allow_same_owner_messages and not pending_calls and _same_owner_plaintext_message(item, "developer"):
+                continue
             developer_message_is_transparent = _historical_pending_developer_message_is_transparent(
                 item,
                 item_type=item_type,

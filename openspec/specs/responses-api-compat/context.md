@@ -360,3 +360,7 @@ content. A missing output cannot be filled in by the agent message. The proof
 does not make the payload portable: unavailable-owner fallback and retirement
 cannot move that original body to another account. Account-neutral recovery
 retains its separate eligibility and projection rules.
+
+## Fork desktop reconnect compatibility
+
+Same-owner proof accepts recognized optional desktop annotations without rewriting the upstream input. See the archived fix-desktop-reconnect-context change for the incident trace and fork deployment workflow. `CODEX_LB_REPLAY_WEB_ACTION_AS_TEXT_IDS` is an empty-by-default JSON array of individually verified incompatible completed web-action IDs; matching records retain all original fields as assistant text. This is an incident adapter, not a blanket conversion of native web actions.
