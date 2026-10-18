@@ -2361,3 +2361,130 @@ async def test_proxy_compact_pinned_owner_with_additional_turn_state_pin_records
     assert calls == []
     assert "blocked_reason=additional_owner_pins" in caplog.text
     assert "continuity_fail_closed surface=compact reason=owner_account_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("responses_route", [False, True])
+@pytest.mark.parametrize(
+    "recovery_kind,recovery_key,completed,turn_state,conflicting_file,expected_status",
+    [
+        (
+            "internal_unanchored_parallel",
+            "account-neutral-replay:v1:verified",
+            True,
+            "http_turn_0123456789abcdef0123456789abcdef",
+            False,
+            200,
+        ),
+        (
+            "session_header",
+            "account-neutral-replay:v1:verified",
+            True,
+            "http_turn_0123456789abcdef0123456789abcdef",
+            False,
+            503,
+        ),
+        (
+            "internal_unanchored_parallel",
+            "ordinary-key",
+            True,
+            "http_turn_0123456789abcdef0123456789abcdef",
+            False,
+            503,
+        ),
+        (
+            "internal_unanchored_parallel",
+            "account-neutral-replay:v1:verified",
+            False,
+            "http_turn_0123456789abcdef0123456789abcdef",
+            False,
+            503,
+        ),
+        (
+            "internal_unanchored_parallel",
+            "account-neutral-replay:v1:verified",
+            True,
+            "opaque-upstream-state",
+            False,
+            503,
+        ),
+        (
+            "internal_unanchored_parallel",
+            "account-neutral-replay:v1:verified",
+            True,
+            "http_turn_0123456789abcdef0123456789abcdef",
+            True,
+            502,
+        ),
+    ],
+)
+async def test_compact_completed_recovery_supersedes_only_synthetic_sticky_hint(
+    async_client,
+    monkeypatch,
+    recovery_kind,
+    recovery_key,
+    completed,
+    turn_state,
+    conflicting_file,
+    expected_status,
+    responses_route,
+):
+    from app.dependencies import get_proxy_service_for_app
+    from app.modules.proxy.sticky_repository import StickySessionsRepository
+
+    accounts = []
+    for name in ("old", "recovered"):
+        raw_id, email = f"compact-recovery-{name}", f"{name}@example.test"
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={"auth_json": ("auth.json", json.dumps(_make_auth_json(raw_id, email)), "application/json")},
+        )
+        assert response.status_code == 200
+        accounts.append(generate_unique_account_id(raw_id, email))
+    old_id, recovered_id = accounts
+    service = get_proxy_service_for_app(async_client._transport.app)
+    async with SessionLocal() as session:
+        await StickySessionsRepository(session).upsert(turn_state, old_id, kind=StickySessionKind.CODEX_SESSION)
+    lookup = AsyncMock(
+        return_value=SimpleNamespace(
+            account_id=recovered_id,
+            session_id="durable-recovered",
+            canonical_kind=recovery_kind,
+            canonical_key=recovery_key,
+            latest_response_id="resp_recovered" if completed else None,
+        )
+    )
+    monkeypatch.setattr(service._durable_bridge, "lookup_turn_state_target", lookup)
+    upstream = AsyncMock(
+        return_value=CompactResponsePayload.model_validate(
+            {
+                "object": "response.compaction",
+                "output": [{"type": "compaction", "encrypted_content": "retained-test-context"}],
+            }
+        )
+    )
+    monkeypatch.setattr(proxy_module, "core_compact_responses", upstream)
+    history = [{"role": "user", "content": "retained visible history"}]
+    if conflicting_file:
+        await service._pin_file_account("file_other_owner", old_id)
+        history = [{"role": "user", "content": [{"type": "input_file", "file_id": "file_other_owner"}]}]
+    sent_history = history + [{"type": "compaction_trigger"}] if responses_route else history
+    response = await async_client.post(
+        "/backend-api/codex/responses" if responses_route else "/backend-api/codex/responses/compact",
+        headers={"x-codex-turn-state": turn_state},
+        json={"model": "gpt-5.1", "instructions": "hi", "input": sent_history},
+    )
+    assert response.status_code == expected_status, response.text
+    if expected_status == 200:
+        upstream.assert_awaited_once()
+        assert upstream.call_args.args[3] == "compact-recovery-recovered"
+        assert upstream.call_args.args[0].to_payload()["input"] == sent_history
+        assert all(call.kwargs["api_key_id"] is None for call in lookup.await_args_list)
+    else:
+        upstream.assert_not_awaited()
+        assert response.json()["error"]["code"] == "continuity_owner_conflict"
+    async with SessionLocal() as session:
+        assert (
+            await StickySessionsRepository(session).get_account_id(turn_state, kind=StickySessionKind.CODEX_SESSION)
+            == old_id
+        )

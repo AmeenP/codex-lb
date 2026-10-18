@@ -66,6 +66,7 @@ from app.modules.proxy.affinity import (
 from app.modules.proxy.affinity_observation import AffinityObservation
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.continuity import (
+    is_http_bridge_account_neutral_replay,
     resolve_required_account_id,
     without_http_bridge_session_affinity_headers,
 )
@@ -955,6 +956,29 @@ class _CompactMixin:
             ("previous response", previous_response_preferred_account_id),
             ("input file", rewritten_file_account_id),
         )
+        if turn_state is not None and _is_synthesized_turn_state(turn_state) and preferred_account_id is not None:
+            # Recovery moves the exact durable alias, not historical sticky rows.
+            # Only a completed, server-created recovery can supersede that hint;
+            # all file/response/live-owner conflicts have already been checked.
+            recovered_target = await proxy._durable_bridge.lookup_turn_state_target(
+                turn_state=turn_state,
+                api_key_id=api_key.id if api_key is not None else None,
+            )
+            if (
+                recovered_target is not None
+                and recovered_target.account_id == preferred_account_id
+                and recovered_target.latest_response_id
+                and is_http_bridge_account_neutral_replay(
+                    kind=recovered_target.canonical_kind,
+                    key=recovered_target.canonical_key,
+                )
+            ):
+                affinity = _affinity_with_payload_continuity(_AffinityPolicy(), payload)
+                logger.info(
+                    "Compact follows completed recovery alias request_id=%s account_id=%s",
+                    request_id,
+                    preferred_account_id,
+                )
         deferred_stream_health: list[tuple[Account, Any, str, int | None]] = []
         deferred_http_500_health: list[tuple[Account, ProxyResponseError, int]] = []
         deferred_proxy_health: list[tuple[Account, ProxyResponseError]] = []
