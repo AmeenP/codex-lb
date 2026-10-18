@@ -318,6 +318,8 @@ class Settings(BaseSettings):
     database_alembic_auto_remap_enabled: bool = True
     database_migration_lock_timeout_seconds: float = Field(default=300.0, gt=0)
     upstream_base_url: str = "https://chatgpt.com/backend-api"
+    # Opt-in recovery for individually verified, non-replayable historical records.
+    replay_web_action_as_text_ids: list[str] = Field(default_factory=list)
     # T3 → dashboard (deprecated env alias, remove next minor)
     upstream_connect_timeout_seconds: float = 8.0
     upstream_websocket_trust_env: bool = Field(default_factory=_default_upstream_websocket_trust_env)

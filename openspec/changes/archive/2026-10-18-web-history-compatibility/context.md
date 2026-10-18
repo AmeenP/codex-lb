@@ -1,0 +1,1 @@
+CODEX_LB_REPLAY_WEB_ACTION_AS_TEXT_IDS is an empty-by-default JSON array of individually verified incompatible completed web-action IDs. Matching records retain all original fields as assistant text; saved rollouts are untouched. The setting is a T4 incident adapter because blanket conversion would affect unverified records. Private IDs stay in host configuration.
