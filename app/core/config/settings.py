@@ -320,6 +320,8 @@ class Settings(BaseSettings):
     upstream_base_url: str = "https://chatgpt.com/backend-api"
     # Opt-in recovery for individually verified, non-replayable historical records.
     replay_web_action_as_text_ids: list[str] = Field(default_factory=list)
+    # Explicit trust in upstream replay of complete encrypted desktop context.
+    quota_failover_retained_context_enabled: bool = False
     # T3 → dashboard (deprecated env alias, remove next minor)
     upstream_connect_timeout_seconds: float = 8.0
     upstream_websocket_trust_env: bool = Field(default_factory=_default_upstream_websocket_trust_env)

@@ -62,7 +62,8 @@ max_items = 5
 # home; the environment leg exists only so an operator locked out of the
 # dashboard can still pin the mode at boot, and it is a fallback, never a seed).
 # Fork incident-recovery allowlist; global rewriting would affect unverified records.
-max = 97
+# P06: explicit opt-in is required before replaying encrypted context across accounts.
+max = 98
 
 [root_files]
 # Complete allowlist of tracked repository-root entries (files and
