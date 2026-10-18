@@ -45,6 +45,7 @@ SETTING_TIERS: Final[dict[str, Tier]] = {
     "database_alembic_auto_remap_enabled": "T0",
     "database_migration_lock_timeout_seconds": "T0",
     "upstream_base_url": "T1",
+    "replay_web_action_as_text_ids": "T4",
     "upstream_connect_timeout_seconds": "T3",
     "upstream_websocket_trust_env": "T1",
     "proxy_request_budget_seconds": "T3",

@@ -17,6 +17,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.core.config.settings import get_settings
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.tool_call_safety import is_downstream_side_effect_tool_call_item
 from app.core.types import JsonObject, JsonValue
@@ -316,7 +317,29 @@ def _is_preserved_non_message_directive(item: Mapping[str, JsonValue]) -> bool:
 
 def _sanitize_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
     sanitized_input: list[JsonValue] = []
+    web_action_ids = get_settings().replay_web_action_as_text_ids
     for item in input_items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "web_search_call"
+            and item.get("status") == "completed"
+            and item.get("id") in web_action_ids
+        ):
+            # Keep the entire record on the wire; saved conversation history
+            # remains untouched and a second normalization is a no-op.
+            item = cast(
+                JsonValue,
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Historical web action: " + json.dumps(item, ensure_ascii=False),
+                        }
+                    ],
+                },
+            )
         item_mapping = _json_mapping_or_none(item)
         if item_mapping is not None and _is_preserved_non_message_directive(item_mapping):
             # Preserved directives are forwarded unchanged; the interleaved

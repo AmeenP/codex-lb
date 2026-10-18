@@ -364,3 +364,7 @@ retains its separate eligibility and projection rules.
 ## Desktop reconnect compatibility
 
 Same-owner proof accepts optional desktop annotations without changing the upstream input. A developer annotation containing content_item_kinds but no turn_id previously rejected a complete full resend and caused stale-anchor injection. Unknown metadata and incomplete tool histories remain rejected; this proof cannot authorize account switching.
+
+## Explicit web-history compatibility
+
+CODEX_LB_REPLAY_WEB_ACTION_AS_TEXT_IDS is an empty-by-default JSON array of individually verified incompatible completed web-action IDs. Matching records retain all original fields as assistant text; saved rollouts are untouched. The setting is a T4 incident adapter because blanket conversion would affect unverified records. Private IDs stay in host configuration.
