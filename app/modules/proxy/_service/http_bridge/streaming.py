@@ -273,6 +273,7 @@ from app.modules.proxy.replay_safety import (
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
+    responses_payload_is_retained_context_replay,
 )
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED
 
@@ -2337,12 +2338,36 @@ class _HTTPBridgeStreamingMixin:
             durable_lookup = None
             return True
 
-        def owner_unavailable_allows_account_neutral_replay(exc: ProxyResponseError) -> bool:
+        async def owner_unavailable_allows_account_neutral_replay(exc: ProxyResponseError) -> bool:
+            nonlocal durable_full_resend_fresh_payload
             if not _http_bridge_is_previous_response_owner_unavailable(exc):
                 return False
             rejection = classify_account_neutral_replay_rejection()
             if rejection is None:
                 return True
+            if (
+                settings.quota_failover_retained_context_enabled
+                and rewritten_file_account_id is None
+                and durable_lookup is not None
+                and durable_full_resend_proof is not None
+                and durable_full_resend_proof.matches(payload, durable_lookup)
+                and request_state.preferred_account_id == durable_lookup.account_id
+                and payload.previous_response_id in (None, durable_lookup.latest_response_id)
+            ):
+                retained_payload = _http_bridge_payload_without_previous_response_id(payload)
+                if responses_payload_is_retained_context_replay(
+                    retained_payload.to_replay_safety_payload()
+                ) and await self._owner_selection_loss_is_quota_caused(durable_lookup.account_id):
+                    durable_full_resend_fresh_payload = retained_payload
+                    _log_http_bridge_event(
+                        "quota_owner_retained_context_replay",
+                        bridge_session_key,
+                        account_id=durable_lookup.account_id,
+                        model=payload.model,
+                        detail="outcome=intact_full_resend_without_anchor",
+                        owner_check_applied=True,
+                    )
+                    return True
             record_account_neutral_replay_rejection(rejection)
             return False
 
@@ -2564,7 +2589,7 @@ class _HTTPBridgeStreamingMixin:
                     setattr(exc, _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR, True)
                 if switch_model_transition_to_account_neutral_fork(exc):
                     continue
-                if not owner_unavailable_allows_account_neutral_replay(exc):
+                if not await owner_unavailable_allows_account_neutral_replay(exc):
                     if await retire_unavailable_continuity_owner(exc):
                         continue
                     exc_code, _exc_message = _proxy_error_code_message(exc)
@@ -2669,7 +2694,7 @@ class _HTTPBridgeStreamingMixin:
                         default_message="HTTP bridge owner request failed",
                     )
                     return
-                owner_forward_fresh_replay = owner_unavailable_allows_account_neutral_replay(exc)
+                owner_forward_fresh_replay = await owner_unavailable_allows_account_neutral_replay(exc)
                 if owner_forward_fresh_replay:
                     switch_to_account_neutral_replay()
                 should_attempt_previous_response_recovery = not owner_forward_fresh_replay and (
@@ -2847,7 +2872,7 @@ class _HTTPBridgeStreamingMixin:
                             defer_account_health_writes=request_state.api_key_reservation is not None,
                         )
                     except ProxyResponseError as capacity_exc:
-                        if owner_unavailable_allows_account_neutral_replay(capacity_exc):
+                        if await owner_unavailable_allows_account_neutral_replay(capacity_exc):
                             switch_to_account_neutral_replay()
                             owner_forward_fresh_replay = True
                             continue

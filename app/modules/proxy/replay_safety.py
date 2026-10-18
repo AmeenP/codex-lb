@@ -489,6 +489,10 @@ def _same_owner_proof_items(input_items: list[JsonValue]) -> list[JsonValue] | N
     for item in input_items:
         if not isinstance(item, dict):
             return None
+        if item.get("type") in ("function_call", "custom_tool_call") and "namespace" in item:
+            if not _is_nonblank_string(item["namespace"]):
+                return None
+            item = {key: value for key, value in item.items() if key != "namespace"}
         metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
         if metadata is None:
             normalized.append(item)
@@ -883,6 +887,112 @@ def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, Json
     if tools is None:
         return True
     return _tools_are_account_neutral(tools)
+
+
+def responses_payload_is_retained_context_replay(payload: Mapping[str, JsonValue]) -> bool:
+    """Validate an opt-in intact replay; this does not prove history completeness.
+
+    The caller must separately prove the durable prefix/output boundary and
+    quota loss. This validation copy is never sent upstream: the original IDs,
+    desktop annotations, encrypted context and all visible content are retained.
+    Unknown or hosted resources still use the strict account-neutral checks.
+    """
+    items = payload.get("input")
+    if not isinstance(items, list) or not items:
+        return False
+    normalized = _same_owner_proof_items(items)
+    if normalized is None:
+        return False
+    validation_items: list[JsonValue] = []
+    for value in normalized:
+        if not isinstance(value, dict):
+            return False
+        item = {key: val for key, val in value.items() if key != _INTERNAL_CHAT_MESSAGE_METADATA_FIELD}
+        item_type = item.get("type")
+        if item_type == "agent_message":
+            if not _is_same_owner_agent_message(item):
+                return False
+            # Only recognized inline text/ciphertext was accepted above.
+            continue
+        if item_type in ("reasoning", "compaction"):
+            allowed = {"type", "id", "encrypted_content"}
+            if item_type == "reasoning":
+                allowed |= {"summary", "content", "status"}
+            if item.keys() - allowed or ("id" in item and not _is_nonblank_string(item["id"])):
+                return False
+            if item_type == "compaction" or "encrypted_content" in item:
+                if not _is_nonblank_string(item.get("encrypted_content")):
+                    return False
+            if item.get("status") not in (None, "completed"):
+                return False
+            for field, part_type in (("summary", "summary_text"), ("content", "reasoning_text")):
+                parts = item.get(field, [])
+                if not isinstance(parts, list) or not all(
+                    isinstance(part, dict)
+                    and set(part) == {"type", "text"}
+                    and part["type"] == part_type
+                    and isinstance(part["text"], str)
+                    for part in parts
+                ):
+                    return False
+            continue
+        if item_type == "additional_tools":
+            tools = _retained_context_validation_tools(item.get("tools"))
+            if tools is None:
+                return False
+            item["tools"] = tools
+        item.pop("id", None)
+        validation_items.append(item)
+    validation_payload = {**payload, "input": validation_items}
+    stream_options = validation_payload.pop("stream_options", None)
+    if stream_options is not None and stream_options != {"reasoning_summary_delivery": "sequential_cutoff"}:
+        return False
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict) and "context" in reasoning:
+        if reasoning["context"] != "all_turns":
+            return False
+        validation_payload["reasoning"] = {key: val for key, val in reasoning.items() if key != "context"}
+    metadata = payload.get("client_metadata")
+    if isinstance(metadata, dict):
+        desktop_fields = {
+            "turn_id",
+            "session_id",
+            "thread_id",
+            "root_turn_id",
+            "mcp_attribution",
+            "guardian_credits_requested",
+        }
+        if any(key in desktop_fields and not isinstance(value, str) for key, value in metadata.items()):
+            return False
+        validation_payload["client_metadata"] = {key: val for key, val in metadata.items() if key not in desktop_fields}
+    if payload.get("tools") is not None:
+        tools = _retained_context_validation_tools(payload["tools"])
+        if tools is None:
+            return False
+        validation_payload["tools"] = tools
+    return responses_payload_is_account_neutral_fresh_replay(validation_payload)
+
+
+def _retained_context_validation_tools(tools: JsonValue) -> list[JsonValue] | None:
+    """Validate one-level desktop namespaces without changing wire declarations."""
+    if not isinstance(tools, list):
+        return None
+    flattened: list[JsonValue] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return None
+        if tool.get("type") != "namespace":
+            flattened.append(tool)
+            continue
+        if (
+            tool.keys() - {"type", "name", "description", "tools"}
+            or not _is_nonblank_string(tool.get("name"))
+            or ("description" in tool and not isinstance(tool["description"], str))
+            or not _tools_are_account_neutral(tool.get("tools"))
+        ):
+            return None
+        flattened.extend(cast(list[JsonValue], tool["tools"]))
+    return flattened if _tools_are_account_neutral(flattened) else None
 
 
 def _reasoning_config_is_account_neutral(reasoning: JsonValue | None) -> bool:
