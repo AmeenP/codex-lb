@@ -10990,3 +10990,12 @@ The proxy MUST default replay_web_action_as_text_ids to an empty list. Only comp
 - **WHEN** that record is normalized for a Responses request
 - **THEN** its complete JSON is preserved as historical assistant text
 - **AND** unlisted and incomplete records remain native items
+
+### Requirement: Fork builds expose their version suffix
+The maintained fork MUST expose its ameen build suffix in package metadata, the runtime X-App-Version header, and the frontend build version.
+
+#### Scenario: Operator identifies the deployed fork
+- **GIVEN** the ameen.2 wheel is installed
+- **WHEN** the operator checks package metadata and a health response
+- **THEN** both identify the ameen.2 build
+- **AND** the bundled frontend uses the same build suffix

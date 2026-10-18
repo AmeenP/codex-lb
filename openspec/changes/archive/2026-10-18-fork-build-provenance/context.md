@@ -1,0 +1,1 @@
+The immutable deployed tag ameen-1.25.0b9.2 retains its original build commit and wheel provenance. This patch stack reorganizes the same runtime files for review. The five internal PRs are tracking/review units for already-deployed code, not requests to redeploy. Future upstream updates must retain the four functional patches or demonstrate they are incorporated upstream.
