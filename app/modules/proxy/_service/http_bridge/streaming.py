@@ -2340,11 +2340,17 @@ class _HTTPBridgeStreamingMixin:
 
         async def owner_unavailable_allows_account_neutral_replay(exc: ProxyResponseError) -> bool:
             nonlocal durable_full_resend_fresh_payload
-            if not _http_bridge_is_previous_response_owner_unavailable(exc):
+            owner_unavailable = _http_bridge_is_previous_response_owner_unavailable(exc)
+            error_code, _ = _proxy_error_code_message(exc)
+            quota_policy_conflict = exc.status_code == 503 and error_code == "continuity_owner_policy_conflict"
+            if not owner_unavailable and not quota_policy_conflict:
                 return False
             rejection = classify_account_neutral_replay_rejection()
-            if rejection is None:
+            if rejection is None and owner_unavailable:
                 return True
+            # Catalog filtering can report an exhausted owner as a policy
+            # conflict. Only the quota-proven, opt-in path below may recover
+            # that error; policy rejection alone grants no replay authority.
             if (
                 settings.quota_failover_retained_context_enabled
                 and rewritten_file_account_id is None
@@ -2368,7 +2374,8 @@ class _HTTPBridgeStreamingMixin:
                         owner_check_applied=True,
                     )
                     return True
-            record_account_neutral_replay_rejection(rejection)
+            if rejection is not None:
+                record_account_neutral_replay_rejection(rejection)
             return False
 
         def switch_to_account_neutral_replay(
