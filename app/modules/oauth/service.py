@@ -26,7 +26,7 @@ from app.core.auth import (
     resolve_seat_identity,
 )
 from app.core.auth.api_key_cache import get_api_key_cache
-from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
+from app.core.cache.invalidation import NAMESPACE_API_KEY, NAMESPACE_MODEL_REFRESH, get_cache_invalidation_poller
 from app.core.clients.oauth import (
     OAuthError,
     OAuthTokens,
@@ -1074,6 +1074,7 @@ class OauthService:
         poller = get_cache_invalidation_poller()
         if poller is not None:
             await poller.bump(NAMESPACE_API_KEY)
+            await poller.bump(NAMESPACE_MODEL_REFRESH)
 
     async def _set_success(self, flow_id: str | None = None) -> None:
         async with self._store.lock:

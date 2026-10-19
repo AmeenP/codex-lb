@@ -558,6 +558,9 @@ def test_json_formatter_includes_trace_and_span_ids_when_available(monkeypatch: 
 
 
 class _DummyScheduler:
+    def request_refresh(self) -> None:
+        return None
+
     def __init__(self) -> None:
         self.started = False
         self.stopped = False

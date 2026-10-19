@@ -45,6 +45,9 @@ from app.modules.dashboard_roles.seed import seed_preset_dashboard_roles  # noqa
 
 
 class _NoopScheduler:
+    def request_refresh(self) -> None:
+        return None
+
     async def start(self) -> None:
         return None
 

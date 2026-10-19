@@ -29,6 +29,7 @@ from app.core.cache.invalidation import (
     NAMESPACE_API_KEY,
     NAMESPACE_DASHBOARD_USERS,
     NAMESPACE_FIREWALL,
+    NAMESPACE_MODEL_REFRESH,
     NAMESPACE_MODEL_REGISTRY,
     NAMESPACE_RESET_CREDITS,
     NAMESPACE_SETTINGS,
@@ -501,6 +502,7 @@ def test_namespace_log_labels_cover_all_namespaces() -> None:
             NAMESPACE_SETTINGS,
             NAMESPACE_RESET_CREDITS,
             NAMESPACE_MODEL_REGISTRY,
+            NAMESPACE_MODEL_REFRESH,
             NAMESPACE_UPSTREAM_ROUTE,
             NAMESPACE_DASHBOARD_USERS,
         )
