@@ -75,6 +75,11 @@ class ModelRefreshScheduler:
     enabled: bool
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
+    _refresh_requested: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def request_refresh(self) -> None:
+        """Wake the owned loop; requests during discovery require another pass."""
+        self._refresh_requested.set()
 
     async def start(self) -> None:
         if not self.enabled:
@@ -95,10 +100,11 @@ class ModelRefreshScheduler:
 
     async def _run_loop(self) -> None:
         while not self._stop.is_set():
+            self._refresh_requested.clear()
             await _warm_codex_version_cache()
             await self._refresh_once()
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self.interval_seconds)
+                await asyncio.wait_for(self._refresh_requested.wait(), timeout=self.interval_seconds)
             except asyncio.TimeoutError:
                 continue
 

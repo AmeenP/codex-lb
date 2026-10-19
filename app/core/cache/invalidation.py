@@ -28,6 +28,7 @@ NAMESPACE_ACCOUNT_SELECTION = "account_selection"
 NAMESPACE_SETTINGS = "settings"
 NAMESPACE_RESET_CREDITS = "reset_credits"
 NAMESPACE_MODEL_REGISTRY = "model_registry"
+NAMESPACE_MODEL_REFRESH = "model_refresh"
 NAMESPACE_UPSTREAM_ROUTE = "upstream_route"
 NAMESPACE_DASHBOARD_USERS = "dashboard_users"
 # Callback return values are ignored; awaitables are awaited for their side
@@ -47,6 +48,7 @@ _NAMESPACE_LOG_LABELS: dict[str, str] = {
     "settings": "settings",
     "reset_credits": "reset_credits",
     "model_registry": "model_registry",
+    "model_refresh": "model_refresh",
     "upstream_route": "upstream_route",
     "dashboard_users": "dashboard_users",
 }

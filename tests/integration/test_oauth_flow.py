@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,18 +17,24 @@ import pytest
 from aiohttp import ClientSession, web
 from fastapi.responses import JSONResponse
 
+import app.core.cache.invalidation as invalidation_module
+import app.core.openai.model_refresh_scheduler as model_scheduler_module
 import app.modules.oauth.service as oauth_module
 from app.core.auth import generate_unique_account_id
 from app.core.clients.oauth import DeviceCode, OAuthError, OAuthTokens
 from app.core.crypto import TokenEncryptor
+from app.core.openai.model_registry import UpstreamModel, get_model_registry
 from app.core.upstream_proxy import UpstreamProxyRouteError
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, OAuthFlowState
 from app.db.session import SessionLocal
+from app.dependencies import _proxy_repo_context
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.oauth import api as oauth_api_module
 from app.modules.oauth.repository import OAuthFlowRepository
 from app.modules.oauth.schemas import ManualCallbackRequest
+from app.modules.proxy.account_cache import get_account_selection_cache
+from app.modules.proxy.load_balancer import LoadBalancer
 
 pytestmark = pytest.mark.integration
 
@@ -578,7 +585,7 @@ async def test_oauth_persist_tokens_invalidates_routing_caches_after_identity_me
     }
     assert account_cache.invalidated is True
     assert api_key_cache.cleared is True
-    assert poller.bumped == ["api_key"]
+    assert poller.bumped == ["api_key", "model_refresh"]
 
 
 @pytest.mark.asyncio
@@ -2837,3 +2844,180 @@ async def test_loser_browser_callback_honors_durable_success_not_error(monkeypat
     async with SessionLocal() as session:
         record = await OAuthFlowRepository(session, TokenEncryptor()).get_by_flow_id(start.flow_id)
     assert record is not None and record.status == "success"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["oauth", "import"])
+@pytest.mark.parametrize("discovery_fails", [False, True])
+async def test_credential_recovery_refreshes_missing_model_on_peer(async_client, monkeypatch, method, discovery_fails):
+    """A login on a follower wakes discovery on the leader, using committed tokens."""
+    email, raw_id = "recovered@example.test", "recovered-workspace"
+    account_id = generate_unique_account_id(raw_id, email)
+    encryptor = TokenEncryptor()
+    async with SessionLocal() as session:
+        for key, plan, status in [
+            (account_id, "pro", AccountStatus.REAUTH_REQUIRED),
+            ("free-account", "free", AccountStatus.ACTIVE),
+        ]:
+            session.add(
+                Account(
+                    id=key,
+                    chatgpt_account_id=raw_id if key == account_id else key,
+                    email=email if key == account_id else "free@example.test",
+                    plan_type=plan,
+                    access_token_encrypted=encryptor.encrypt("old-access"),
+                    refresh_token_encrypted=encryptor.encrypt("old-refresh"),
+                    id_token_encrypted=encryptor.encrypt("old-id"),
+                    last_refresh=utcnow(),
+                    status=status,
+                )
+            )
+        await session.commit()
+
+    model = UpstreamModel(
+        slug="gpt-6-astra",
+        display_name="Astra",
+        description="",
+        context_window=128000,
+        input_modalities=("text",),
+        supported_reasoning_levels=(),
+        default_reasoning_level=None,
+        supports_reasoning_summaries=False,
+        support_verbosity=False,
+        default_verbosity=None,
+        prefer_websockets=True,
+        supports_parallel_tool_calls=True,
+        supported_in_api=True,
+        minimal_client_version=None,
+        priority=0,
+        available_in_plans=frozenset({"pro"}),
+    )
+    # Retain metadata from the previously healthy paid catalog, as in production.
+    await get_model_registry().update(
+        {"pro": [model]},
+        per_account_results={account_id: ("pro", [model])},
+        active_account_plans={account_id: "pro"},
+    )
+    fetched_credentials = []
+
+    async def fetch_models(access_token, upstream_account_id, **kwargs):
+        if upstream_account_id != raw_id:
+            return [replace(model, slug="gpt-6-luna", available_in_plans=frozenset({"free"}))]
+        fetched_credentials.append(access_token)
+        if discovery_fails:
+            raise model_scheduler_module.ModelFetchError(503, "offline")
+        return [model]
+
+    async def ensure_fresh(self, account, **kwargs):
+        return account
+
+    class Leader:
+        async def run_if_leader(self, callback):
+            return await callback()
+
+    monkeypatch.setattr(model_scheduler_module, "_get_leader_election", lambda: Leader())
+    monkeypatch.setattr(model_scheduler_module, "_warm_codex_version_cache", AsyncMock())
+    monkeypatch.setattr(model_scheduler_module, "fetch_models_for_plan", fetch_models)
+    monkeypatch.setattr(model_scheduler_module.AuthManager, "ensure_fresh", ensure_fresh)
+    monkeypatch.setattr(oauth_module.OAuthCallbackServer, "start", AsyncMock())
+    id_token = _encode_jwt(
+        {
+            "email": email,
+            "chatgpt_account_id": raw_id,
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+        }
+    )
+    monkeypatch.setattr(
+        oauth_module,
+        "exchange_authorization_code",
+        AsyncMock(
+            return_value=OAuthTokens(
+                access_token="new-access",
+                refresh_token="new-refresh",
+                id_token=id_token,
+            )
+        ),
+    )
+
+    origin = invalidation_module.CacheInvalidationPoller(SessionLocal)
+    peer = invalidation_module.CacheInvalidationPoller(SessionLocal)
+    scheduler = model_scheduler_module.ModelRefreshScheduler(interval_seconds=3600, enabled=True)
+    peer.on_invalidation(invalidation_module.NAMESPACE_MODEL_REFRESH, scheduler.request_refresh)
+    await origin.prime()
+    await peer.prime()
+    monkeypatch.setattr(invalidation_module, "_poller", origin)
+    completed = asyncio.Event()
+    refresh = model_scheduler_module.ModelRefreshScheduler._refresh_once
+
+    async def observed_refresh(self):
+        await refresh(self)
+        completed.set()
+
+    monkeypatch.setattr(model_scheduler_module.ModelRefreshScheduler, "_refresh_once", observed_refresh)
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(completed.wait(), 3)
+        completed.clear()
+        snapshot = get_model_registry().get_snapshot()
+        assert snapshot is not None and "gpt-6-astra" not in snapshot.models
+        balancer = LoadBalancer(_proxy_repo_context)
+        before = await balancer.select_account(model="gpt-6-astra")
+        assert before.error_code == "no_plan_support_for_model"
+        if method == "oauth":
+            start = await async_client.post("/api/oauth/start", json={"forceMethod": "browser"})
+            state = _oauth_state_token(start.json()["authorizationUrl"])
+            # A rejected callback must not wake discovery.
+            bad = await async_client.post(
+                "/api/oauth/manual-callback",
+                json={
+                    "callbackUrl": "http://localhost:1455/auth/callback?code=bad&state=wrong",
+                },
+            )
+            assert bad.json()["status"] == "error"
+            await peer._poll_once()
+            assert not scheduler._refresh_requested.is_set()
+            response = await async_client.post(
+                "/api/oauth/manual-callback",
+                json={
+                    "callbackUrl": f"http://localhost:1455/auth/callback?code=ok&state={state}",
+                },
+            )
+            assert response.json()["status"] == "success"
+        else:
+            settings = await async_client.put("/api/settings", json={"importWithoutOverwrite": False})
+            assert settings.status_code == 200
+            auth_json = {
+                "tokens": {
+                    "idToken": id_token,
+                    "accessToken": "new-access",
+                    "refreshToken": "new-refresh",
+                    "accountId": raw_id,
+                }
+            }
+            response = await async_client.post(
+                "/api/accounts/import",
+                files={
+                    "auth_json": ("auth.json", json.dumps(auth_json), "application/json"),
+                },
+            )
+        assert response.status_code == 200
+        assert fetched_credentials == []
+        generation = get_account_selection_cache().generation
+        await peer._poll_once()
+        await asyncio.wait_for(completed.wait(), 3)
+        assert fetched_credentials == ["new-access"]
+        assert get_account_selection_cache().generation > generation
+        snapshot = get_model_registry().get_snapshot()
+        assert snapshot is not None
+        assert ("gpt-6-astra" in snapshot.models) is not discovery_fails
+        if not discovery_fails:
+            assert account_id in snapshot.model_accounts["gpt-6-astra"]
+            after = await balancer.select_account(model="gpt-6-astra")
+            assert after.account is not None and after.account.id == account_id
+            assert after.error_code is None
+        async with SessionLocal() as session:
+            saved = await session.get(Account, account_id)
+            assert saved is not None and saved.status == AccountStatus.ACTIVE
+            assert encryptor.decrypt(saved.access_token_encrypted) == "new-access"
+    finally:
+        await scheduler.stop()

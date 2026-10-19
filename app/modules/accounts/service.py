@@ -21,7 +21,7 @@ from app.core.auth import (
 )
 from app.core.auth.api_key_cache import get_api_key_cache
 from app.core.auth.refresh import RefreshError
-from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
+from app.core.cache.invalidation import NAMESPACE_API_KEY, NAMESPACE_MODEL_REFRESH, get_cache_invalidation_poller
 from app.core.clients.http import lease_http_session
 from app.core.clients.usage import (
     ConsumeRateLimitResetCreditResponse,
@@ -536,6 +536,9 @@ class AccountsService:
         if saved.status == AccountStatus.ACTIVE:
             clear_account_routing_unavailable(saved.id)
         get_account_selection_cache().invalidate()
+        poller = get_cache_invalidation_poller()
+        if poller is not None:
+            await poller.bump(NAMESPACE_MODEL_REFRESH)
         return AccountImportResponse(
             account_id=saved.id,
             email=saved.email,

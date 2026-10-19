@@ -556,6 +556,9 @@ async def test_startup_loads_persisted_snapshot_before_first_refresh(app_instanc
     import app.main as main_module
 
     class _NoopScheduler:
+        def request_refresh(self) -> None:
+            return None
+
         async def start(self) -> None:
             return None
 
@@ -586,6 +589,9 @@ async def test_model_scheduler_starts_after_invalidation_poller_installed(app_in
     poller_installed_at_start: list[bool] = []
 
     class _ProbeScheduler:
+        def request_refresh(self) -> None:
+            return None
+
         async def start(self) -> None:
             poller_installed_at_start.append(get_cache_invalidation_poller() is not None)
 
@@ -660,6 +666,9 @@ async def test_startup_primes_poll_baseline_before_reconcile(app_instance, monke
         return False
 
     class _ProbeScheduler:
+        def request_refresh(self) -> None:
+            return None
+
         async def start(self) -> None:
             order.append("scheduler_start")
 

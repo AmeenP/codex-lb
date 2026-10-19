@@ -563,6 +563,7 @@ async def lifespan(app: FastAPI):
         NAMESPACE_API_KEY,
         NAMESPACE_DASHBOARD_USERS,
         NAMESPACE_FIREWALL,
+        NAMESPACE_MODEL_REFRESH,
         NAMESPACE_MODEL_REGISTRY,
         NAMESPACE_RESET_CREDITS,
         NAMESPACE_SETTINGS,
@@ -582,7 +583,9 @@ async def lifespan(app: FastAPI):
     # namespace through the global poller, and a not-yet-installed poller would
     # silently drop that bump (followers would then wait for the refresh-tick
     # backstop instead of the cache poll bound).
+    model_scheduler = build_model_refresh_scheduler()
     cache_poller = CacheInvalidationPoller(SessionLocal)
+    cache_poller.on_invalidation(NAMESPACE_MODEL_REFRESH, model_scheduler.request_refresh)
     cache_poller.on_invalidation(NAMESPACE_API_KEY, get_api_key_cache().clear)
     cache_poller.on_invalidation(NAMESPACE_FIREWALL, get_firewall_ip_cache().invalidate_all)
     routing_availability_cache = get_routing_availability_cache()
@@ -684,7 +687,6 @@ async def lifespan(app: FastAPI):
     usage_scheduler = build_usage_refresh_scheduler()
     api_key_limit_reset_scheduler = build_api_key_limit_reset_scheduler()
     api_key_last_used_flush_scheduler = build_api_key_last_used_flush_scheduler()
-    model_scheduler = build_model_refresh_scheduler()
     sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()
     quota_planner_scheduler = build_quota_planner_scheduler()
     auth_guardian_scheduler = build_auth_guardian_scheduler()

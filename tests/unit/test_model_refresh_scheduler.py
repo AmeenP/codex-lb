@@ -617,3 +617,58 @@ async def test_warmed_version_reaches_the_non_native_upstream_fingerprint(monkey
         assert warm["originator"] == "codex_cli_rs"
     finally:
         await cache.invalidate()
+
+
+@pytest.mark.asyncio
+async def test_refresh_requests_wake_idle_loop_and_coalesce_during_fetch(monkeypatch):
+    scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=3600, enabled=True)
+    entered = asyncio.Queue()
+    release = asyncio.Event()
+    calls = 0
+
+    async def refresh(self):
+        nonlocal calls
+        calls += 1
+        entered.put_nowait(calls)
+        if calls == 2:
+            await release.wait()
+
+    monkeypatch.setattr(scheduler_module, "_warm_codex_version_cache", AsyncMock())
+    monkeypatch.setattr(scheduler_module.ModelRefreshScheduler, "_refresh_once", refresh)
+    await scheduler.start()
+    try:
+        assert await asyncio.wait_for(entered.get(), 1) == 1
+        scheduler.request_refresh()
+        assert await asyncio.wait_for(entered.get(), 1) == 2
+        for _ in range(5):
+            scheduler.request_refresh()
+        assert calls == 2
+        release.set()
+        assert await asyncio.wait_for(entered.get(), 1) == 3
+    finally:
+        await scheduler.stop()
+    assert calls == 3
+    assert scheduler._task is None
+
+
+@pytest.mark.asyncio
+async def test_stop_awaits_requested_refresh_cleanup(monkeypatch):
+    scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=3600, enabled=True)
+    entered = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def refresh(self):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(scheduler_module, "_warm_codex_version_cache", AsyncMock())
+    monkeypatch.setattr(scheduler_module.ModelRefreshScheduler, "_refresh_once", refresh)
+    scheduler.request_refresh()
+    await scheduler.start()
+    await asyncio.wait_for(entered.wait(), 1)
+    await scheduler.stop()
+    assert cleaned.is_set()
+    assert scheduler._task is None
