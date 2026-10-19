@@ -121,11 +121,12 @@ def test_retained_context_rejects_nonportable_or_unknown_state(desktop_payload, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_error", ["unavailable", "policy_conflict", "unrelated_503"])
 @pytest.mark.parametrize(
     "case", ["quota", "disabled", "non_quota", "missing_output", "changed_prefix", "file_pin", "wrong_anchor"]
 )
 async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
-    monkeypatch, db_setup, desktop_payload, case
+    monkeypatch, db_setup, desktop_payload, case, owner_error
 ):
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     settings = Settings(quota_failover_retained_context_enabled=case != "disabled")
@@ -179,9 +180,12 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
     )
     monkeypatch.setattr(service, "_http_bridge_local_owner_account_id", AsyncMock(return_value="exhausted"))
     monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", AsyncMock(return_value="exhausted"))
-    failure = ProxyResponseError(
-        502, proxy_service.openai_error("previous_response_owner_unavailable", "Owner unavailable")
-    )
+    status, code = {
+        "unavailable": (502, "previous_response_owner_unavailable"),
+        "policy_conflict": (503, "continuity_owner_policy_conflict"),
+        "unrelated_503": (503, "upstream_unavailable"),
+    }[owner_error]
+    failure = ProxyResponseError(status, proxy_service.openai_error(code, "Owner unavailable"))
     session = _make_bridge_session()
     session.request_model = "gpt-6-astra"
     create = AsyncMock(side_effect=[failure, session])
@@ -211,7 +215,7 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
         enforce_openai_sdk_contract=False,
         rewritten_file_account_id="exhausted" if case == "file_pin" else None,
     )
-    if case != "quota":
+    if case != "quota" or owner_error == "unrelated_503":
         with pytest.raises(ProxyResponseError):
             _ = [chunk async for chunk in stream]
         assert not sent
