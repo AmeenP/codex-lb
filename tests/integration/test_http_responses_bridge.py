@@ -19276,3 +19276,87 @@ async def test_smart_single_turn_stays_http_before_history_promotes(async_client
     assert len(upstreams) == 1
     assert "reason=smart_single_turn" in caplog.text
     assert "reason=smart_history" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/backend-api/codex/responses", "/v1/responses"])
+@pytest.mark.parametrize("complete_history", [True, False])
+async def test_http_bridge_service_tier_handoff_preserves_history_and_requested_tier(
+    async_client, app_instance, monkeypatch, route, complete_history
+):
+    from tests.unit.test_model_registry import _model
+
+    settings = _make_app_settings(enabled=True).model_copy(update={"quota_failover_retained_context_enabled": True})
+    _install_proxy_settings(monkeypatch, app_settings=settings, dashboard_settings=_make_dashboard_settings())
+    owner = await _import_account(async_client, "tier-owner", "tier-owner@example.com", plan_type="pro")
+    replacement = await _import_account(async_client, "tier-target", "tier-target@example.com", plan_type="promax")
+    registry = ModelRegistry(ttl_seconds=60)
+    fast = replace(_model("gpt-6-astra"), raw={"service_tiers": [{"slug": "priority"}]})
+    ultra = replace(_model("gpt-6-astra"), raw={"service_tiers": [{"slug": "ultrafast"}]})
+    await registry.update(
+        {"pro": [fast], "promax": [ultra]},
+        per_account_results={owner: ("pro", [fast]), replacement: ("promax", [ultra])},
+    )
+    monkeypatch.setattr(load_balancer_module, "get_model_registry", lambda: registry)
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: registry)
+    monkeypatch.setattr(http_bridge_streaming_module, "get_model_registry", lambda: registry)
+    upstreams = {
+        "tier-owner": _FakeBridgeUpstreamWebSocket("resp_tier_owner"),
+        "tier-target": _FakeBridgeUpstreamWebSocket("resp_tier_target"),
+    }
+    connected = []
+
+    async def fresh(self, account, **kwargs):
+        return account
+
+    async def connect(headers, access_token, account_id_header, **kwargs):
+        connected.append(account_id_header)
+        return upstreams[account_id_header]
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fresh)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
+    original_input = [
+        {"type": "compaction", "encrypted_content": "retained-context"},
+        {"role": "user", "content": "Remember the project context."},
+    ]
+    body = {
+        "model": "gpt-6-astra",
+        "instructions": "Continue.",
+        "input": original_input,
+        "service_tier": "priority",
+        "stream": True,
+    }
+    headers = {"thread-id": "tier-switch-thread", "user-agent": "codex_exec/0.162.0"}
+    first = await async_client.post(route, json=body, headers=headers)
+    assert first.status_code == 200, first.text
+    assert "response.completed" in first.text
+    assert connected == ["tier-owner"]
+    full_input = original_input + [
+        {"role": "assistant", "content": [{"type": "output_text", "text": "OK"}]},
+        {"role": "user", "content": "Continue at the faster tier."},
+    ]
+    if not complete_history:
+        full_input[1] = {"role": "user", "content": "Different old context."}
+    followup_headers = (
+        {**headers, "x-codex-turn-state": first.headers["x-codex-turn-state"]} if complete_history else headers
+    )
+    second = await async_client.post(
+        route, json={**body, "input": full_input, "service_tier": "ultrafast"}, headers=followup_headers
+    )
+    if not complete_history:
+        assert second.status_code == 503, second.text
+        assert second.json()["error"]["code"] == "continuity_owner_policy_conflict"
+        assert connected == ["tier-owner"]
+        return
+    assert second.status_code == 200, second.text
+    assert "response.completed" in second.text
+    assert connected == ["tier-owner", "tier-target"]
+    sent = json.loads(upstreams["tier-target"].sent_text[0])
+    assert sent["input"] == full_input
+    assert sent["service_tier"] == "ultrafast"
+    assert not sent.get("previous_response_id")
+    service = get_proxy_service_for_app(app_instance)
+    recovered = await service._durable_bridge.lookup_turn_state_target(
+        turn_state=first.headers["x-codex-turn-state"], api_key_id=None
+    )
+    assert recovered is not None and recovered.account_id == replacement

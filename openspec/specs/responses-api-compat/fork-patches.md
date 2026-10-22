@@ -11,7 +11,10 @@ Baseline: upstream/main `72630bbfeee9e3b0d9acfb95e2b1e706b8b0188e`.
 | P05 | Identify and document the deployed fork build | [#5](https://github.com/AmeenP/codex-lb/pull/5) | Fork maintenance |
 | P06 | Recover quota-exhausted sessions with intact retained context | [#6](https://github.com/AmeenP/codex-lb/pull/6) | Automatic quota failover |
 | P07 | Follow the verified recovery owner during compaction | [#7](https://github.com/AmeenP/codex-lb/pull/7) | Post-handoff compaction repair |
-| P08 | Recover quota-exhausted owners rejected by model eligibility | Internal PR on `fix/patch-08-quota-policy-conflict` | HTTP bridge 503 recovery |
+| P08 | Recover quota-exhausted owners rejected by model eligibility | [#8](https://github.com/AmeenP/codex-lb/pull/8) | HTTP bridge 503 recovery |
+| P09 | Refresh model availability after reauthentication | [#9](https://github.com/AmeenP/codex-lb/pull/9) | Account catalog refresh |
+| P10 | Clear stale rate limits after completed probes | [#10](https://github.com/AmeenP/codex-lb/pull/10) | Account probe recovery |
+| P11 | Preserve verified context when the requested tier excludes its owner | [#11](https://github.com/AmeenP/codex-lb/pull/11) | Fast-to-Ultrafast handoff |
 
 Each patch has exactly one commit and one PR in AmeenP/codex-lb. PRs are stacked in the order above. P03 depends on P01; the linear stack keeps each diff reviewable. The default stable branch contains the whole stack. The original deployment tag and backup tag retain pre-cleanup history.
 

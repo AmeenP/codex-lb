@@ -1,20 +1,23 @@
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import Settings
+from app.core.openai.model_registry import ModelRegistry
 from app.core.openai.requests import ResponsesRequest
 from app.db.models import AccountStatus, HttpBridgeSessionState
 from app.modules.proxy import service as proxy_service
+from app.modules.proxy._service.http_bridge import streaming
 from app.modules.proxy.replay_safety import (
     responses_payload_is_account_neutral_fresh_replay,
     responses_payload_is_retained_context_replay,
 )
+from tests.unit.test_model_registry import _model
 from tests.unit.test_proxy_http_bridge import _make_bridge_session
 from tests.unit.test_replay_safety import _agent_followup
 
@@ -121,14 +124,35 @@ def test_retained_context_rejects_nonportable_or_unknown_state(desktop_payload, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("owner_error", ["unavailable", "policy_conflict", "unrelated_503"])
+@pytest.mark.parametrize("handoff", ["quota", "tier", "tier_model_change"])
+@pytest.mark.parametrize("owner_error", ["unavailable", "policy_conflict", "pre_submit_continuity", "unrelated_503"])
 @pytest.mark.parametrize(
     "case", ["quota", "disabled", "non_quota", "missing_output", "changed_prefix", "file_pin", "wrong_anchor"]
 )
 async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
-    monkeypatch, db_setup, desktop_payload, case, owner_error
+    monkeypatch, db_setup, desktop_payload, case, owner_error, handoff
 ):
-    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    @asynccontextmanager
+    async def repos():
+        yield SimpleNamespace(
+            accounts=SimpleNamespace(
+                get_by_id_fresh=AsyncMock(return_value=SimpleNamespace(status=AccountStatus.ACTIVE))
+            )
+        )
+
+    service = proxy_service.ProxyService(repos)
+    if handoff.startswith("tier"):
+        desktop_payload["service_tier"] = "ultrafast"
+        registry = ModelRegistry(ttl_seconds=60)
+        fast = replace(_model("gpt-6-astra"), raw={"service_tiers": [{"slug": "priority"}]})
+        ultra = replace(_model("gpt-6-astra"), raw={"service_tiers": [{"slug": "ultrafast"}]})
+        await registry.update(
+            {"pro": [fast], "promax": [ultra]},
+            per_account_results={"exhausted": ("pro", [fast]), "replacement": ("promax", [ultra])},
+        )
+        if case == "non_quota":
+            desktop_payload["service_tier"] = "priority"
+        monkeypatch.setattr(streaming, "get_model_registry", lambda: registry)
     settings = Settings(quota_failover_retained_context_enabled=case != "disabled")
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     dashboard = SimpleNamespace(
@@ -156,7 +180,7 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
         latest_input_item_count=stored_count,
         latest_input_full_fingerprint=proxy_service._fingerprint_input_items(desktop_payload["input"][:stored_count]),
         latest_pending_tool_calls={"call_1": "custom_tool_call"},
-        model="gpt-6-astra",
+        model="gpt-6-sol" if handoff == "tier_model_change" else "gpt-6-astra",
     )
     if case == "missing_output":
         desktop_payload["input"] = [x for x in desktop_payload["input"] if x.get("type") != "custom_tool_call_output"]
@@ -165,7 +189,7 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
     elif case == "wrong_anchor":
         desktop_payload["previous_response_id"] = "resp_other"
     payload = ResponsesRequest.model_validate(desktop_payload)
-    quota_check = AsyncMock(return_value=case != "non_quota")
+    quota_check = AsyncMock(return_value=handoff == "quota" and case != "non_quota")
     monkeypatch.setattr(service, "_owner_selection_loss_is_quota_caused", quota_check)
     monkeypatch.setattr(service._durable_bridge, "lookup_request_targets", AsyncMock(return_value=lookup))
     monkeypatch.setattr(
@@ -184,6 +208,7 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
         "unavailable": (502, "previous_response_owner_unavailable"),
         "policy_conflict": (503, "continuity_owner_policy_conflict"),
         "unrelated_503": (503, "upstream_unavailable"),
+        "pre_submit_continuity": (502, "stream_incomplete"),
     }[owner_error]
     failure = ProxyResponseError(status, proxy_service.openai_error(code, "Owner unavailable"))
     session = _make_bridge_session()
@@ -215,7 +240,13 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
         enforce_openai_sdk_contract=False,
         rewritten_file_account_id="exhausted" if case == "file_pin" else None,
     )
-    if case != "quota" or owner_error == "unrelated_503":
+    if (
+        case != "quota"
+        or owner_error == "unrelated_503"
+        or (handoff == "tier" and owner_error not in ("policy_conflict", "pre_submit_continuity"))
+        or (handoff == "quota" and owner_error == "pre_submit_continuity")
+        or handoff == "tier_model_change"
+    ):
         with pytest.raises(ProxyResponseError):
             _ = [chunk async for chunk in stream]
         assert not sent
@@ -223,6 +254,7 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
         return
     assert [chunk async for chunk in stream] == ['data: {"type":"response.completed"}\n\n']
     assert sent[0]["input"] == desktop_payload["input"]
+    assert sent[0].get("service_tier") == desktop_payload.get("service_tier")
     assert sent[0].get("previous_response_id") is None
     assert create.await_count == 2
     replacement = create.await_args_list[1].kwargs
@@ -230,7 +262,10 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
     assert "exhausted" in replacement["exclude_account_ids"]
     assert "thread-id" not in replacement["headers"]
     assert "x-codex-turn-state" not in replacement["headers"]
-    quota_check.assert_awaited_once_with("exhausted")
+    if owner_error == "pre_submit_continuity":
+        quota_check.assert_not_awaited()
+    else:
+        quota_check.assert_awaited_once_with("exhausted")
 
 
 @pytest.mark.asyncio
@@ -249,3 +284,67 @@ async def test_shared_owner_quota_check_requires_persisted_quota_status(status):
     assert await service._owner_selection_loss_is_quota_caused("owner") == (
         status in (AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "allowed",
+        "owner_in_scope",
+        "owner_outside_scope",
+        "target_outside_scope",
+        "paused",
+        "reauth",
+        "missing_account",
+        "lookup_error",
+        "no_catalog",
+        "plan_only_catalog",
+        "model_absent",
+        "owner_model_absent",
+        "unknown_tier",
+        "same_tier",
+        "default_tier",
+    ],
+)
+async def test_tier_handoff_requires_authoritative_scoped_model_eligibility(monkeypatch, case):
+    registry = ModelRegistry(ttl_seconds=60)
+    fast = replace(_model("gpt-6-astra"), raw={"service_tiers": [{"slug": "priority"}]})
+    ultra = replace(_model("gpt-6-astra"), raw={"service_tiers": [{"slug": "ultrafast"}]})
+    if case != "no_catalog":
+        await registry.update(
+            {"pro": [fast], "promax": [ultra]},
+            per_account_results=None
+            if case == "plan_only_catalog"
+            else {
+                "owner": ("pro", [] if case == "owner_model_absent" else [fast]),
+                "replacement": ("promax", [ultra]),
+            },
+        )
+    monkeypatch.setattr(streaming, "get_model_registry", lambda: registry)
+    status = {"paused": AccountStatus.PAUSED, "reauth": AccountStatus.REAUTH_REQUIRED}.get(case, AccountStatus.ACTIVE)
+    get = AsyncMock(
+        return_value=None if case == "missing_account" else SimpleNamespace(status=status),
+        side_effect=RuntimeError("lookup failed") if case == "lookup_error" else None,
+    )
+
+    @asynccontextmanager
+    async def repos():
+        yield SimpleNamespace(accounts=SimpleNamespace(get_by_id_fresh=get))
+
+    api_key = None
+    scopes = {
+        "owner_in_scope": ["owner", "replacement"],
+        "owner_outside_scope": ["replacement"],
+        "target_outside_scope": ["owner"],
+    }
+    if case in scopes:
+        api_key = SimpleNamespace(account_assignment_scope_enabled=True, assigned_account_ids=scopes[case])
+    service = proxy_service.ProxyService(repos)
+    result = await service._owner_selection_loss_is_service_tier_caused(
+        account_id="owner",
+        model="missing-model" if case == "model_absent" else "gpt-6-astra",
+        service_tier={"unknown_tier": "future", "same_tier": "priority", "default_tier": None}.get(case, "ultrafast"),
+        api_key=api_key,
+    )
+    assert result is (case in ("allowed", "owner_in_scope"))
