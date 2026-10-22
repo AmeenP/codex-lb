@@ -203,6 +203,16 @@ _AMBIGUOUS_CONVERSATION_OWNER_MESSAGE = "Conversation owner cannot be determined
 
 
 @dataclass(frozen=True, slots=True)
+class AccountProbeObservation:
+    started_at: float
+    health_version: int
+    status: AccountStatus
+    reset_at: int | None
+    blocked_at: int | None
+    deactivation_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _NormalizedUsageInputs:
     primary_used: float | None
     primary_reset: int | None
@@ -1820,13 +1830,33 @@ class LoadBalancer:
                 runtime.version += 1
                 runtime.health_version += 1
 
+    async def capture_account_probe(self, account_id: str) -> AccountProbeObservation | None:
+        lock = await self._get_account_lock(account_id)
+        async with lock:
+            health_version = self._runtime.setdefault(account_id, RuntimeState()).health_version
+            started_at = self._clock.time()
+        async with self._repo_factory() as repos:
+            account = await repos.accounts.get_by_id(account_id)
+            if account is None:
+                return None
+            return AccountProbeObservation(
+                started_at=started_at,
+                health_version=health_version,
+                status=account.status,
+                reset_at=account.reset_at,
+                blocked_at=account.blocked_at,
+                deactivation_reason=account.deactivation_reason,
+            )
+
     async def record_probe_result(
         self,
         *,
         account_id: str,
         http_status: int,
-    ) -> None:
+        observation: AccountProbeObservation | None = None,
+    ) -> bool:
         """Settle an operator probe into this replica's advisory health state."""
+        recovered = False
         lock = await self._get_account_lock(account_id)
         if not 200 <= http_status < 300:
             async with lock:
@@ -1835,19 +1865,23 @@ class LoadBalancer:
                     runtime.probe_success_streak = 0
                 runtime.version += 1
                 runtime.health_version += 1
-            return
+            return recovered
 
         # Usage reads intentionally run without the per-account lock. Capture a
         # health-observation token first so an older successful probe cannot
         # clear a failure or health-tier change recorded while those reads are
         # in flight, while lease-only pressure changes remain harmless.
         async with lock:
-            expected_health_version = self._runtime.setdefault(account_id, RuntimeState()).health_version
+            expected_health_version = (
+                observation.health_version
+                if observation is not None
+                else self._runtime.setdefault(account_id, RuntimeState()).health_version
+            )
 
         async with self._repo_factory() as repos:
             account = await repos.accounts.get_by_id(account_id)
             if account is None:
-                return
+                return recovered
             primary_entry = await repos.usage.latest_entry_for_account(account_id, window="primary")
             secondary_entry = await repos.usage.latest_entry_for_account(account_id, window="secondary")
             monthly_entry = await repos.usage.latest_entry_for_account(account_id, window="monthly")
@@ -1888,7 +1922,53 @@ class LoadBalancer:
             # observation wins, and a later probe can retry with a fresh usage
             # snapshot. Lease-only version bumps must not drop Force Probe.
             if runtime.health_version != expected_health_version:
-                return
+                return recovered
+
+            # Only a completed probe plus newly fetched quota may retire an
+            # unchanged old 429. Persisted CAS also fences other replicas and
+            # operator actions; the pre-request health token fences local errors.
+            if observation is not None and observation.status == account.status == AccountStatus.RATE_LIMITED:
+                available = [
+                    value for value in (health_primary_used, normalized_usage.secondary_used) if value is not None
+                ]
+                fresh_quota = any(
+                    entry is not None
+                    and entry.used_percent is not None
+                    and entry.recorded_at.replace(tzinfo=timezone.utc).timestamp() >= observation.started_at
+                    for entry in (
+                        primary_entry if health_primary_used is not None else None,
+                        normalized_usage.effective_secondary_entry,
+                    )
+                )
+                old_block = observation.blocked_at is None or (
+                    observation.blocked_at + RATE_LIMITED_MIN_COOLDOWN_SECONDS <= observation.started_at
+                )
+                if old_block and fresh_quota and available and all(value < 100.0 for value in available):
+                    async with self._repo_factory() as repos:
+                        recovered = await repos.accounts.update_status_if_current(
+                            account_id,
+                            AccountStatus.ACTIVE,
+                            None,
+                            None,
+                            blocked_at=None,
+                            expected_status=observation.status,
+                            expected_deactivation_reason=observation.deactivation_reason,
+                            expected_reset_at=observation.reset_at,
+                            expected_blocked_at=observation.blocked_at,
+                        )
+                    if recovered:
+                        account.status = AccountStatus.ACTIVE
+                        account.reset_at = None
+                        account.blocked_at = None
+                        account.deactivation_reason = None
+                        runtime.reset_at = None
+                        runtime.blocked_at = None
+                        runtime.cooldown_until = None
+                        runtime.error_count = 0
+                        runtime.last_error_at = None
+                        runtime.version += 1
+                        runtime.health_version += 1
+                        get_account_selection_cache().invalidate()
 
             normalized_state = _state_from_account(
                 account=account,
@@ -1901,7 +1981,7 @@ class LoadBalancer:
             )
             account_status = normalized_state.status
             if account_status not in (AccountStatus.ACTIVE, AccountStatus.REAUTH_REQUIRED):
-                return
+                return recovered
 
             was_probe_eligible = runtime.health_tier == HEALTH_TIER_PROBING
             if was_probe_eligible and (runtime.error_count > 0 or runtime.last_error_at is not None):
@@ -1921,7 +2001,7 @@ class LoadBalancer:
                 soft_drain_enabled=resilience.soft_drain_enabled,
             )
             if runtime.health_tier != HEALTH_TIER_PROBING:
-                return
+                return recovered
             if not was_probe_eligible and (runtime.error_count > 0 or runtime.last_error_at is not None):
                 runtime.error_count = 0
                 runtime.last_error_at = None
@@ -1941,6 +2021,8 @@ class LoadBalancer:
                 now=now,
                 soft_drain_enabled=resilience.soft_drain_enabled,
             )
+
+        return recovered
 
     def _state_for(self, account: Account) -> AccountState:
         runtime = self._runtime.setdefault(account.id, RuntimeState())

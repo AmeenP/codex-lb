@@ -300,6 +300,8 @@ async def probe_account(
     context: AccountsContext = Depends(get_accounts_context),
 ) -> AccountProbeResponse:
     requested_model = body.model if body is not None else None
+    proxy_service = get_proxy_service_for_app(request.app)
+    observation = await proxy_service.capture_account_probe(account_id)
     try:
         result = await context.service.probe_account(account_id, model=requested_model)
     except AccountNotProbableError as exc:
@@ -314,10 +316,13 @@ async def probe_account(
     probe_succeeded = 200 <= result.probe_status_code < 300
     if not probe_succeeded or result.usage_refresh_ready_for_probe_settlement():
         try:
-            await get_proxy_service_for_app(request.app).record_account_probe_result(
+            recovered = await proxy_service.record_account_probe_result(
                 account_id=result.account_id,
                 http_status=result.probe_status_code,
+                observation=observation,
             )
+            if recovered:
+                result.account_status_after = "active"
         except Exception:
             logger.exception(
                 "Force Probe advisory settlement failed account_id=%s probe_status_code=%s",

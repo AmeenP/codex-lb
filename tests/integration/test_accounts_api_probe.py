@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock
@@ -17,7 +18,7 @@ from app.core.balancer.logic import PROBE_SUCCESS_STREAK_REQUIRED
 from app.core.openai.model_registry import get_model_registry
 from app.core.usage.models import UsagePayload
 from app.core.utils.time import utcnow
-from app.db.models import UsageHistory
+from app.db.models import Account, AccountStatus, UsageHistory
 from app.db.session import SessionLocal
 from app.db.snapshot import clone_row
 from app.modules.accounts import api as accounts_api
@@ -307,7 +308,7 @@ async def test_probe_active_account_returns_snapshot(
         if authoritative and "gpt-5.6-luna" not in catalog:
             assert registry.is_suppressed_model("gpt-5.6-luna")
     captured: dict = {}
-    record_probe_result = AsyncMock()
+    record_probe_result = AsyncMock(return_value=False)
 
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):
         captured["model"] = model
@@ -322,7 +323,11 @@ async def test_probe_active_account_returns_snapshot(
     monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
     monkeypatch.setattr(UsageUpdater, "force_refresh_result", _force_refresh_fetches_without_writing)
 
-    proxy_service = type("_ProbeRecorder", (), {"record_account_probe_result": record_probe_result})()
+    proxy_service = type(
+        "_ProbeRecorder",
+        (),
+        {"record_account_probe_result": record_probe_result, "capture_account_probe": AsyncMock(return_value=None)},
+    )()
     monkeypatch.setattr(accounts_api, "get_proxy_service_for_app", lambda app: proxy_service)
 
     account_id = await _import_test_account(
@@ -350,6 +355,7 @@ async def test_probe_active_account_returns_snapshot(
     record_probe_result.assert_awaited_once_with(
         account_id=account_id,
         http_status=200,
+        observation=None,
     )
 
 
@@ -357,7 +363,13 @@ async def test_probe_active_account_returns_snapshot(
 async def test_probe_route_omits_unsupported_output_limit(async_client, monkeypatch):
     captured: dict[str, Any] = {}
 
+    class _Content:
+        async def iter_chunked(self, size):
+            yield b'data: {"type":"response.completed"}\n\n'
+
     class _Response:
+        content = _Content()
+
         def __init__(self, status: int) -> None:
             self.status = status
 
@@ -383,8 +395,12 @@ async def test_probe_route_omits_unsupported_output_limit(async_client, monkeypa
     async def _force_refresh_fetches_without_writing(self, account, *, ignore_refresh_disabled=False):  # noqa: ARG001
         return AccountRefreshResult(usage_written=False, fetch_succeeded=True)
 
-    record_probe_result = AsyncMock()
-    proxy_service = type("_ProbeRecorder", (), {"record_account_probe_result": record_probe_result})()
+    record_probe_result = AsyncMock(return_value=False)
+    proxy_service = type(
+        "_ProbeRecorder",
+        (),
+        {"record_account_probe_result": record_probe_result, "capture_account_probe": AsyncMock(return_value=None)},
+    )()
     monkeypatch.setattr("app.modules.accounts.service.lease_http_session", lambda: _Lease())
     monkeypatch.setattr(UsageUpdater, "force_refresh_result", _force_refresh_fetches_without_writing)
     monkeypatch.setattr(accounts_api, "get_proxy_service_for_app", lambda app: proxy_service)
@@ -402,7 +418,7 @@ async def test_probe_route_omits_unsupported_output_limit(async_client, monkeypa
     assert captured["payload"]["stream"] is True
     assert captured["payload"]["store"] is False
     assert "max_output_tokens" not in captured["payload"]
-    record_probe_result.assert_awaited_once_with(account_id=account_id, http_status=200)
+    record_probe_result.assert_awaited_once_with(account_id=account_id, http_status=200, observation=None)
 
 
 @pytest.mark.asyncio
@@ -420,7 +436,11 @@ async def test_probe_active_account_returns_snapshot_when_advisory_settlement_fa
 
     monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
     monkeypatch.setattr(UsageUpdater, "force_refresh_result", _force_refresh_fetches_without_writing)
-    proxy_service = type("_ProbeRecorder", (), {"record_account_probe_result": record_probe_result})()
+    proxy_service = type(
+        "_ProbeRecorder",
+        (),
+        {"record_account_probe_result": record_probe_result, "capture_account_probe": AsyncMock(return_value=None)},
+    )()
     monkeypatch.setattr(accounts_api, "get_proxy_service_for_app", lambda app: proxy_service)
 
     account_id = await _import_test_account(
@@ -439,12 +459,13 @@ async def test_probe_active_account_returns_snapshot_when_advisory_settlement_fa
     record_probe_result.assert_awaited_once_with(
         account_id=account_id,
         http_status=200,
+        observation=None,
     )
 
 
 @pytest.mark.asyncio
 async def test_probe_success_skips_advisory_settlement_when_usage_refresh_fails(async_client, monkeypatch):
-    record_probe_result = AsyncMock()
+    record_probe_result = AsyncMock(return_value=False)
 
     async def _probe_without_usage_refresh(self, account_id, model=None):  # noqa: ARG001 - route orchestration only
         response = AccountProbeResponse(
@@ -458,7 +479,11 @@ async def test_probe_success_skips_advisory_settlement_when_usage_refresh_fails(
         return response
 
     monkeypatch.setattr(AccountsService, "probe_account", _probe_without_usage_refresh)
-    proxy_service = type("_ProbeRecorder", (), {"record_account_probe_result": record_probe_result})()
+    proxy_service = type(
+        "_ProbeRecorder",
+        (),
+        {"record_account_probe_result": record_probe_result, "capture_account_probe": AsyncMock(return_value=None)},
+    )()
     monkeypatch.setattr(accounts_api, "get_proxy_service_for_app", lambda app: proxy_service)
 
     response = await async_client.post("/api/accounts/acc_probe_usage_refresh_failed/probe")
@@ -472,7 +497,7 @@ async def test_probe_success_skips_advisory_settlement_when_usage_refresh_fails(
 
 @pytest.mark.asyncio
 async def test_probe_failure_still_records_advisory_settlement_after_usage_refresh_fails(async_client, monkeypatch):
-    record_probe_result = AsyncMock()
+    record_probe_result = AsyncMock(return_value=False)
 
     async def _failed_probe_without_usage_refresh(self, account_id, model=None):  # noqa: ARG001 - route orchestration only
         response = AccountProbeResponse(
@@ -486,7 +511,11 @@ async def test_probe_failure_still_records_advisory_settlement_after_usage_refre
         return response
 
     monkeypatch.setattr(AccountsService, "probe_account", _failed_probe_without_usage_refresh)
-    proxy_service = type("_ProbeRecorder", (), {"record_account_probe_result": record_probe_result})()
+    proxy_service = type(
+        "_ProbeRecorder",
+        (),
+        {"record_account_probe_result": record_probe_result, "capture_account_probe": AsyncMock(return_value=None)},
+    )()
     monkeypatch.setattr(accounts_api, "get_proxy_service_for_app", lambda app: proxy_service)
 
     response = await async_client.post("/api/accounts/acc_probe_usage_refresh_failed_429/probe")
@@ -495,6 +524,7 @@ async def test_probe_failure_still_records_advisory_settlement_after_usage_refre
     record_probe_result.assert_awaited_once_with(
         account_id="acc_probe_usage_refresh_failed_429",
         http_status=429,
+        observation=None,
     )
 
 
@@ -756,3 +786,109 @@ async def test_probe_uses_default_model_when_body_omitted(async_client, monkeypa
     # *some* model string rather than coupling the test to the constant.
     assert isinstance(captured["model"], str)
     assert captured["model"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "recover",
+        "exhausted",
+        "failed_probe",
+        "stale_usage",
+        "failed_refresh",
+        "new_429",
+        "paused",
+        "reauth_required",
+        "local_error",
+        "recent_block",
+    ],
+)
+async def test_completed_probe_recovers_only_unchanged_stale_rate_limit(async_client, app_instance, monkeypatch, case):
+    """The public route must clear both persisted and live cooldowns without losing newer evidence."""
+    account_id = await _import_test_account(async_client, email="stale@example.com", account_id="acc_stale")
+    now = int(time.time())
+    blocked_at = now if case == "recent_block" else now - 86400
+    reset_at = now + 86400 * 3
+    async with SessionLocal() as session:
+        account = await session.get(Account, account_id)
+        account.status = AccountStatus.RATE_LIMITED
+        account.blocked_at = blocked_at
+        account.reset_at = reset_at
+        account.routing_policy = "burn_first"
+        if case == "stale_usage":
+            session.add(
+                UsageHistory(
+                    account_id=account_id,
+                    window="secondary",
+                    used_percent=0.0,
+                    recorded_at=utcnow().replace(year=2020),
+                    reset_at=reset_at,
+                    window_minutes=10080,
+                )
+            )
+        await session.commit()
+    balancer = accounts_api.get_proxy_service_for_app(app_instance)._load_balancer
+    runtime = RuntimeState(blocked_at=float(blocked_at), reset_at=float(reset_at), cooldown_until=float(reset_at))
+    balancer._runtime[account_id] = runtime
+
+    async def probe(self, **kwargs):
+        if case in ("new_429", "paused", "reauth_required"):
+            async with SessionLocal() as session:
+                account = await session.get(Account, account_id)
+                if case == "new_429":
+                    account.blocked_at = now
+                    account.reset_at = reset_at + 60
+                else:
+                    account.status = AccountStatus(case)
+                await session.commit()
+        if case == "local_error":
+            runtime.health_version += 1
+            runtime.error_count = 3
+        return 0 if case == "failed_probe" else 200
+
+    async def refresh(self, account, **kwargs):
+        if case not in ("stale_usage", "failed_refresh"):
+            async with SessionLocal() as session:
+                session.add(
+                    UsageHistory(
+                        account_id=account_id,
+                        window="secondary",
+                        used_percent=100.0 if case == "exhausted" else 0.0,
+                        recorded_at=utcnow(),
+                        reset_at=reset_at,
+                        window_minutes=10080,
+                    )
+                )
+                await session.commit()
+        return AccountRefreshResult(usage_written=case != "stale_usage", fetch_succeeded=case != "failed_refresh")
+
+    monkeypatch.setattr(AccountsService, "_send_probe_request", probe)
+    monkeypatch.setattr(UsageUpdater, "force_refresh_result", refresh)
+    response = await async_client.post(f"/api/accounts/{account_id}/probe", json={"model": "gpt-6-astra"})
+    assert response.status_code == 200, response.text
+    expected_status = (
+        AccountStatus.ACTIVE
+        if case == "recover"
+        else (AccountStatus(case) if case in ("paused", "reauth_required") else AccountStatus.RATE_LIMITED)
+    )
+    async with SessionLocal() as session:
+        account = await session.get(Account, account_id)
+        assert account.status == expected_status
+        assert account.routing_policy == "burn_first"
+        if case == "recover":
+            assert account.reset_at is None
+            assert account.blocked_at is None
+            assert response.json()["accountStatusAfter"] == "active"
+            assert runtime.cooldown_until is None
+            assert runtime.reset_at is None
+            assert runtime.blocked_at is None
+        else:
+            assert account.reset_at == reset_at + (60 if case == "new_429" else 0)
+            assert runtime.cooldown_until == reset_at
+    if case == "local_error":
+        assert runtime.error_count == 3
+    if case == "recover":
+        selected = await balancer.select_account()
+        assert selected.account is not None
+        assert selected.account.id == account_id

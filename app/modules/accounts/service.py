@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import aclosing
 from datetime import timedelta
 from typing import cast
 from uuid import uuid4
@@ -23,6 +24,8 @@ from app.core.auth.api_key_cache import get_api_key_cache
 from app.core.auth.refresh import RefreshError
 from app.core.cache.invalidation import NAMESPACE_API_KEY, NAMESPACE_MODEL_REFRESH, get_cache_invalidation_poller
 from app.core.clients.http import lease_http_session
+from app.core.clients.proxy import _iter_sse_events
+from app.core.clients.stream_errors import StreamEventTooLargeError, StreamIdleTimeoutError
 from app.core.clients.usage import (
     ConsumeRateLimitResetCreditResponse,
     UsageFetchError,
@@ -32,11 +35,13 @@ from app.core.clients.usage import (
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.openai.host_models import resolve_default_host_model
+from app.core.openai.parsing import classify_event_type
 from app.core.plan_types import coerce_account_plan_type
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
 from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.upstream_proxy.resolver import _is_missing_upstream_proxy_schema
 from app.core.usage.models import UsagePayload
+from app.core.utils.sse import parse_sse_data_json
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, DashboardSettings
 from app.db.session import get_background_session
@@ -794,10 +799,19 @@ class AccountsService:
         try:
             async with lease_http_session() as session:
                 async with session.post(url, headers=headers, json=body, timeout=timeout) as resp:
-                    # Initiating the request is enough to wake the upstream
-                    # rate-limiter; we do not consume the SSE body.
-                    return resp.status
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    if not 200 <= resp.status < 300:
+                        return resp.status
+                    # HTTP 200 can still carry a rate-limit error or a truncated
+                    # stream. Only a completed response proves availability.
+                    async with aclosing(_iter_sse_events(resp, PROBE_REQUEST_TIMEOUT_SECONDS, 1024 * 1024)) as events:
+                        async for event in events:
+                            event_type = classify_event_type(parse_sse_data_json(event))
+                            if event_type == "response.completed":
+                                return resp.status
+                            if event_type in ("error", "response.failed", "response.incomplete"):
+                                return PROBE_NETWORK_FAILURE_STATUS
+                    return PROBE_NETWORK_FAILURE_STATUS
+        except (aiohttp.ClientError, asyncio.TimeoutError, StreamEventTooLargeError, StreamIdleTimeoutError) as exc:
             logger.warning(
                 "Probe upstream request failed account=%s error=%s",
                 chatgpt_account_id,

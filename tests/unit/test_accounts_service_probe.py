@@ -302,13 +302,34 @@ async def test_import_usage_refresh_allowed_tolerates_missing_upstream_proxy_set
 
 
 @pytest.mark.asyncio
-async def test_send_probe_request_uses_shared_http_client(monkeypatch):
+@pytest.mark.parametrize(
+    "http_status,stream,expected",
+    [
+        (200, 'data: {"type":"response.completed"}\r\n\r\n', 200),
+        (200, 'data: {"type":"response.failed"}\n\ndata: {"type":"response.completed"}\n\n', 0),
+        (200, 'data: {"type":"error","error":{"code":"rate_limit_exceeded"}}\n\n', 0),
+        (200, 'data: {"type":"response.incomplete"}\n\n', 0),
+        (200, 'data: {"type":"response.created"}\n\n', 0),
+        (200, "data: [DONE]\n\n", 0),
+        (200, "data: invalid\n\n", 0),
+        (204, "", 0),
+        (429, "", 429),
+    ],
+)
+async def test_send_probe_request_uses_shared_http_client(monkeypatch, http_status, stream, expected):
     account = _make_account()
     service = _build_service(account=account)
     captured: dict[str, Any] = {}
 
+    class _Content:
+        async def iter_chunked(self, size):
+            encoded = stream.encode()
+            for offset in range(0, len(encoded), 7):
+                yield encoded[offset : offset + 7]
+
     class _Response:
-        status = 204
+        status = http_status
+        content = _Content()
 
         async def __aenter__(self):
             return self
@@ -339,7 +360,7 @@ async def test_send_probe_request_uses_shared_http_client(monkeypatch):
         model="gpt-5.5-test",
     )
 
-    assert status == 204
+    assert status == expected
     assert captured["leased"] is True
     assert captured["released"] is True
     assert captured["url"].endswith("/backend-api/codex/responses")
