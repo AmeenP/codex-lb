@@ -49,6 +49,7 @@ from app.core.metrics.prometheus import (
     stream_idle_timeout_total,
     stream_keepalive_sent_total,
 )
+from app.core.openai.model_registry import get_model_registry
 from app.core.openai.requests import (
     ResponsesRequest,
 )
@@ -57,6 +58,7 @@ from app.core.utils.request_id import ensure_request_id, ensure_request_scope_id
 from app.core.utils.sse import format_sse_event, parse_sse_data_json, sse_block_with_payload
 from app.core.utils.time import utcnow
 from app.db.models import (
+    AccountStatus,
     HttpBridgeSessionState,
     StickySessionKind,
 )
@@ -893,6 +895,38 @@ async def _registered_turn_state_anchor_lookup(
 
 
 class _HTTPBridgeStreamingMixin:
+    async def _owner_selection_loss_is_service_tier_caused(
+        self: Any,
+        *,
+        account_id: str,
+        model: str,
+        service_tier: str | None,
+        api_key: ApiKeyData | None,
+    ) -> bool:
+        if not service_tier or service_tier.strip().lower() in {"auto", "default"}:
+            return False
+        allowed_ids = (
+            set(api_key.assigned_account_ids)
+            if api_key is not None and api_key.account_assignment_scope_enabled
+            else None
+        )
+        if allowed_ids is not None and account_id not in allowed_ids:
+            return False
+        try:
+            async with self._repo_factory() as repos:
+                account = await repos.accounts.get_by_id_fresh(account_id)
+                if account is None or account.status != AccountStatus.ACTIVE:
+                    return False
+        except Exception:
+            logger.warning("Tier recovery owner lookup failed; keeping request owner-bound", exc_info=True)
+            return False
+        registry = get_model_registry()
+        model_accounts = registry.account_ids_for_model(model)
+        tier_accounts = registry.account_ids_for_model_service_tier(model, service_tier)
+        if model_accounts is None or account_id not in model_accounts or not tier_accounts:
+            return False
+        return account_id not in tier_accounts and (allowed_ids is None or bool(tier_accounts & allowed_ids))
+
     async def validate_http_bridge_legacy_forward_anchor(
         self: Any,
         *,
@@ -2342,15 +2376,20 @@ class _HTTPBridgeStreamingMixin:
             nonlocal durable_full_resend_fresh_payload
             owner_unavailable = _http_bridge_is_previous_response_owner_unavailable(exc)
             error_code, _ = _proxy_error_code_message(exc)
-            quota_policy_conflict = exc.status_code == 503 and error_code == "continuity_owner_policy_conflict"
-            if not owner_unavailable and not quota_policy_conflict:
+            owner_policy_conflict = exc.status_code == 503 and error_code == "continuity_owner_policy_conflict"
+            pre_submit_continuity_failure = (
+                exc.status_code == 502
+                and error_code == "stream_incomplete"
+                and getattr(exc, _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR, False)
+            )
+            if not owner_unavailable and not owner_policy_conflict and not pre_submit_continuity_failure:
                 return False
             rejection = classify_account_neutral_replay_rejection()
             if rejection is None and owner_unavailable:
                 return True
-            # Catalog filtering can report an exhausted owner as a policy
-            # conflict. Only the quota-proven, opt-in path below may recover
-            # that error; policy rejection alone grants no replay authority.
+            # Policy rejection alone grants no replay authority. The opt-in
+            # path requires either persisted quota loss or an authoritative,
+            # scoped tier-only exclusion, plus the same sealed history proof.
             if (
                 settings.quota_failover_retained_context_enabled
                 and rewritten_file_account_id is None
@@ -2361,12 +2400,28 @@ class _HTTPBridgeStreamingMixin:
                 and payload.previous_response_id in (None, durable_lookup.latest_response_id)
             ):
                 retained_payload = _http_bridge_payload_without_previous_response_id(payload)
-                if responses_payload_is_retained_context_replay(
-                    retained_payload.to_replay_safety_payload()
-                ) and await self._owner_selection_loss_is_quota_caused(durable_lookup.account_id):
+                if responses_payload_is_retained_context_replay(retained_payload.to_replay_safety_payload()):
+                    quota_loss = not pre_submit_continuity_failure and await self._owner_selection_loss_is_quota_caused(
+                        durable_lookup.account_id
+                    )
+                    tier_loss = (
+                        not quota_loss
+                        and (owner_policy_conflict or pre_submit_continuity_failure)
+                        and durable_lookup.model == payload.model
+                        and await self._owner_selection_loss_is_service_tier_caused(
+                            account_id=durable_lookup.account_id,
+                            model=payload.model,
+                            service_tier=payload.service_tier,
+                            api_key=api_key,
+                        )
+                    )
+                    if not quota_loss and not tier_loss:
+                        if rejection is not None:
+                            record_account_neutral_replay_rejection(rejection)
+                        return False
                     durable_full_resend_fresh_payload = retained_payload
                     _log_http_bridge_event(
-                        "quota_owner_retained_context_replay",
+                        "tier_owner_retained_context_replay" if tier_loss else "quota_owner_retained_context_replay",
                         bridge_session_key,
                         account_id=durable_lookup.account_id,
                         model=payload.model,
