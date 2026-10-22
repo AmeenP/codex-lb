@@ -1601,7 +1601,7 @@ On the HTTP bridge / forwarded compact path the caller passes an `api_key_reserv
 
 After the operator Force Probe request and its immediate usage refresh complete, the system MUST report the result to the process-local load balancer. Before settling an HTTP 2xx response, the load balancer MUST reload the refreshed standard usage rows and apply the same elapsed-window, weekly-only-primary, zero-primary-capacity, plan-applicable monthly-window, and long-window normalization used by ordinary account selection. The loaded account and usage snapshot MUST remain usable after its repository session rolls back and closes, without lazy database reads during settlement. The settlement MUST apply only when the replica-local health-observation version has not changed since snapshot loading began, so a newer failure or other health observation cannot be cleared by an older probe result. An accepted 2xx settlement MUST count as one successful probe observation, clear replica-local transient error state, and advance the existing fixed probe-success state machine only when the normalized status and usage remain eligible to probe. Reaching the fixed success-streak requirement MUST return the account to `HEALTHY` routing.
 
-A non-2xx upstream response or the network-failure sentinel MUST NOT count as a successful observation and MUST reset an in-progress probe-success streak. Probe settlement MUST NOT override a persisted hard-blocked status or usage condition, invent a persistent account error, or change the Force Probe response schema.
+A non-2xx upstream response or the network-failure sentinel MUST NOT count as a successful observation and MUST reset an in-progress probe-success streak. Except for the guarded completed-probe stale rate-limit recovery defined below, probe settlement MUST NOT override a persisted hard-blocked status or usage condition, invent a persistent account error, or change the Force Probe response schema.
 
 #### Scenario: Successful Force Probes rehabilitate a probing account
 
@@ -2239,3 +2239,30 @@ Account probes without an explicit model MUST use the same ordered registry sele
 #### Scenario: No candidate qualifies
 - **WHEN** neither candidate has plan visibility without suppression
 - **THEN** the selected host is `gpt-5.6-luna` and existing downstream error handling applies
+
+### Requirement: Probe success requires streaming completion
+Force Probe MUST report HTTP 2xx as successful only after receiving response.completed. Error, failed, incomplete, malformed-only, truncated, timed-out, and oversized streams MUST report the existing failure sentinel.
+
+#### Scenario: Headers alone do not prove success
+- **WHEN** upstream returns HTTP 200 but fails or closes without response.completed
+- **THEN** the probe cannot clear a rate limit
+
+### Requirement: Completed probes recover stale rate limits
+A completed probe with a successful usage fetch SHALL clear an unchanged rate_limited status and persisted and replica-local cooldowns only when a new applicable quota sample exists and all known normalized applicable windows have quota. The existing 30-second block floor MUST remain enforced. Background refresh without a completed probe MUST continue respecting plausible cooldowns.
+
+#### Scenario: Weekly-only account proves an old deadline stale
+- **GIVEN** an unchanged multi-day rate-limit deadline and a block older than 30 seconds
+- **WHEN** a probe completes and a weekly sample recorded after the probe began shows quota available
+- **THEN** the response reports active and persisted and replica-local cooldowns are cleared
+
+#### Scenario: Fresh quota is required
+- **WHEN** usage fetch fails, produces no new applicable sample, or reports exhausted quota
+- **THEN** a completed probe cannot clear the cooldown
+
+### Requirement: Probe recovery preserves newer state
+Recovery MUST compare status, reason, reset, and block markers with the pre-request snapshot and reject changed replica health versions. Newer failures, pauses, authentication failures, deletion, and quota exhaustion MUST win over an older probe. Routing policies and conversation history MUST remain unchanged.
+
+#### Scenario: Concurrent changes survive recovery
+- **GIVEN** an account starts a probe while rate limited
+- **WHEN** a newer failure, pause, authentication failure, or deletion occurs before settlement
+- **THEN** the stale probe cannot override that change

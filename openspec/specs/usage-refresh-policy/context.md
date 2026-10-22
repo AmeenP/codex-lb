@@ -134,3 +134,11 @@ does not count as evidence that the account is healthy.
 
 - [#676 - initial bug report on `/wham/usage` vs. Settings UI divergence](https://github.com/Soju06/codex-lb/issues/676)
 - [#677 - dashboard per-account force-probe action](https://github.com/Soju06/codex-lb/issues/677)
+
+## Verified probe recovery (P10)
+
+An upstream deadline can remain stored for days after an account becomes usable. A quota refresh alone does not disprove throttling. A completed pinned response together with newly fetched available quota does: Force Probe can now clear an unchanged old rate-limit block, including weekly-only accounts. For example, a Sunday reset hint must not keep an account excluded on Thursday after an Astra probe completes and its weekly usage is zero.
+
+The request is bounded to 30 seconds and individual SSE events to 1 MiB. HTTP 200 with a failure event or missing completion remains unsuccessful. Pre-request runtime and persisted observations prevent a successful old probe from erasing newer failures or operator actions; the existing 30-second floor excludes fresh throttles. No settings, credential changes, or conversation edits are involved.
+
+The maintained fork records this as P10 (`fix/patch-10-probe-rate-limit-recovery`), built as `1.25.0b9+ameen.5` on top of P09.

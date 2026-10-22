@@ -33,7 +33,7 @@ from app.modules.usage.mappers import usage_history_to_window_row
 from app.modules.usage.updater import UsageUpdater
 
 if TYPE_CHECKING:
-    from app.modules.proxy.load_balancer import LoadBalancer
+    from app.modules.proxy.load_balancer import AccountProbeObservation, LoadBalancer
 
 
 class _RateLimitServiceProtocol(Protocol):
@@ -77,17 +77,23 @@ def _has_available_usage_account(
 
 
 class _RateLimitMixin:
+    async def capture_account_probe(self, account_id: str) -> AccountProbeObservation | None:
+        proxy = cast(_RateLimitServiceProtocol, self)
+        return await proxy._load_balancer.capture_account_probe(account_id)
+
     async def record_account_probe_result(
         self,
         *,
         account_id: str,
         http_status: int,
-    ) -> None:
+        observation: AccountProbeObservation | None = None,
+    ) -> bool:
         """Feed a dashboard Force Probe into this process's health state."""
         proxy = cast(_RateLimitServiceProtocol, self)
-        await proxy._load_balancer.record_probe_result(
+        return await proxy._load_balancer.record_probe_result(
             account_id=account_id,
             http_status=http_status,
+            observation=observation,
         )
 
     async def rate_limit_headers(self) -> dict[str, str]:
