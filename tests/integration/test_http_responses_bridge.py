@@ -19323,6 +19323,7 @@ async def test_http_bridge_owner_handoff_preserves_history_and_requested_tier(
     body = {
         "model": "gpt-6-astra",
         "instructions": "Continue.",
+        "include": ["output.encrypted_content"],
         "input": original_input,
         "service_tier": "priority",
         "stream": True,
@@ -19370,6 +19371,7 @@ async def test_http_bridge_owner_handoff_preserves_history_and_requested_tier(
     sent = json.loads(upstreams["tier-target"].sent_text[0])
     assert sent["input"] == full_input
     assert sent["service_tier"] == requested_tier
+    assert sent["include"] == body["include"]
     assert not sent.get("previous_response_id")
     service = get_proxy_service_for_app(app_instance)
     recovered = await service._durable_bridge.lookup_turn_state_target(
