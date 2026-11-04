@@ -19281,8 +19281,9 @@ async def test_smart_single_turn_stays_http_before_history_promotes(async_client
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["/backend-api/codex/responses", "/v1/responses"])
 @pytest.mark.parametrize("complete_history", [True, False])
-async def test_http_bridge_service_tier_handoff_preserves_history_and_requested_tier(
-    async_client, app_instance, monkeypatch, route, complete_history
+@pytest.mark.parametrize("handoff", ["tier", "pause"])
+async def test_http_bridge_owner_handoff_preserves_history_and_requested_tier(
+    async_client, app_instance, monkeypatch, route, complete_history, handoff
 ):
     from tests.unit.test_model_registry import _model
 
@@ -19331,6 +19332,14 @@ async def test_http_bridge_service_tier_handoff_preserves_history_and_requested_
     assert first.status_code == 200, first.text
     assert "response.completed" in first.text
     assert connected == ["tier-owner"]
+    if handoff == "pause":
+        pause = await async_client.post(f"/api/accounts/{owner}/pause")
+        assert pause.status_code == 200, pause.text
+        await registry.update(
+            {"pro": [fast], "promax": [fast]},
+            per_account_results={owner: ("pro", [fast]), replacement: ("promax", [fast])},
+        )
+    requested_tier = "priority" if handoff == "pause" else "ultrafast"
     full_input = original_input + [
         {"role": "assistant", "content": [{"type": "output_text", "text": "OK"}]},
         {"role": "user", "content": "Continue at the faster tier."},
@@ -19340,12 +19349,19 @@ async def test_http_bridge_service_tier_handoff_preserves_history_and_requested_
     followup_headers = (
         {**headers, "x-codex-turn-state": first.headers["x-codex-turn-state"]} if complete_history else headers
     )
-    second = await async_client.post(
-        route, json={**body, "input": full_input, "service_tier": "ultrafast"}, headers=followup_headers
-    )
+    followup_body = {**body, "input": full_input, "service_tier": requested_tier}
+    if handoff == "pause" and not complete_history:
+        # An explicit anchor cannot use the separate proxy-anchor retirement path.
+        followup_body["previous_response_id"] = "resp_tier_owner_1"
+    second = await async_client.post(route, json=followup_body, headers=followup_headers)
+    if handoff == "pause":
+        accounts = (await async_client.get("/api/accounts")).json()["accounts"]
+        assert next(a for a in accounts if a["accountId"] == owner)["status"] == "paused"
     if not complete_history:
-        assert second.status_code == 503, second.text
-        assert second.json()["error"]["code"] == "continuity_owner_policy_conflict"
+        assert second.status_code == (502 if handoff == "pause" else 503), second.text
+        assert second.json()["error"]["code"] == (
+            "previous_response_owner_unavailable" if handoff == "pause" else "continuity_owner_policy_conflict"
+        )
         assert connected == ["tier-owner"]
         return
     assert second.status_code == 200, second.text
@@ -19353,7 +19369,7 @@ async def test_http_bridge_service_tier_handoff_preserves_history_and_requested_
     assert connected == ["tier-owner", "tier-target"]
     sent = json.loads(upstreams["tier-target"].sent_text[0])
     assert sent["input"] == full_input
-    assert sent["service_tier"] == "ultrafast"
+    assert sent["service_tier"] == requested_tier
     assert not sent.get("previous_response_id")
     service = get_proxy_service_for_app(app_instance)
     recovered = await service._durable_bridge.lookup_turn_state_target(
