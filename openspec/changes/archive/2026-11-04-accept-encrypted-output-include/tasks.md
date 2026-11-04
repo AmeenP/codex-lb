@@ -1,0 +1,3 @@
+- [x] Accept and preserve the encrypted-output include value.
+- [x] Validate request and HTTP bridge handoff coverage.
+- [x] Package the existing deployed compatibility fix with P12.

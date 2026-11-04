@@ -11084,3 +11084,16 @@ The owner MUST remain paused.
 #### Scenario: Pause recovery is unproven
 - **WHEN** history is incomplete, a resource is owner-bound, the owner is outside scope or pending deletion, the status lookup fails, or recovery is disabled
 - **THEN** the bridge SHALL preserve the existing error and SHALL NOT authorize pause recovery
+
+### Requirement: Accept encrypted-output include requests
+Responses request validation SHALL accept `output.encrypted_content` in `include`
+and preserve it in the upstream request. Unsupported include values MUST remain
+validation errors.
+
+#### Scenario: Desktop requests encrypted output
+- **WHEN** a desktop Responses request includes `output.encrypted_content`
+- **THEN** request validation SHALL accept it and forward that include value unchanged
+
+#### Scenario: Unknown include value
+- **WHEN** a request includes an unsupported value
+- **THEN** request validation SHALL reject it

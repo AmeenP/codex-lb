@@ -16,6 +16,7 @@ Baseline: upstream/main `72630bbfeee9e3b0d9acfb95e2b1e706b8b0188e`.
 | P10 | Clear stale rate limits after completed probes | [#10](https://github.com/AmeenP/codex-lb/pull/10) | Account probe recovery |
 | P11 | Preserve verified context when the requested tier excludes its owner | [#11](https://github.com/AmeenP/codex-lb/pull/11) | Fast-to-Ultrafast handoff |
 | P12 | Preserve verified context when an operator pauses its owner | [#12](https://github.com/AmeenP/codex-lb/pull/12) | Intentional account handoff |
+| P13 | Accept the desktop encrypted-output include value | [#13](https://github.com/AmeenP/codex-lb/pull/13) | Preserve deployed compatibility fix |
 
 Each patch has exactly one commit and one PR in AmeenP/codex-lb. PRs are stacked in the order above. P03 depends on P01; the linear stack keeps each diff reviewable. The default stable branch contains the whole stack. The original deployment tag and backup tag retain pre-cleanup history.
 
