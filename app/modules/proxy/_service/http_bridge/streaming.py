@@ -895,6 +895,27 @@ async def _registered_turn_state_anchor_lookup(
 
 
 class _HTTPBridgeStreamingMixin:
+    async def _owner_selection_loss_is_operator_paused(
+        self: Any, *, account_id: str, api_key: ApiKeyData | None
+    ) -> bool:
+        if (
+            api_key is not None
+            and api_key.account_assignment_scope_enabled
+            and account_id not in api_key.assigned_account_ids
+        ):
+            return False
+        try:
+            async with self._repo_factory() as repos:
+                account = await repos.accounts.get_by_id_fresh(account_id)
+                return (
+                    account is not None
+                    and account.status == AccountStatus.PAUSED
+                    and account.delete_requested_at is None
+                )
+        except Exception:
+            logger.warning("Pause recovery owner lookup failed; keeping request owner-bound", exc_info=True)
+            return False
+
     async def _owner_selection_loss_is_service_tier_caused(
         self: Any,
         *,
@@ -2388,8 +2409,8 @@ class _HTTPBridgeStreamingMixin:
             if rejection is None and owner_unavailable:
                 return True
             # Policy rejection alone grants no replay authority. The opt-in
-            # path requires either persisted quota loss or an authoritative,
-            # scoped tier-only exclusion, plus the same sealed history proof.
+            # path requires persisted quota loss, an explicit operator pause,
+            # or a scoped tier-only exclusion, plus the same sealed history proof.
             if (
                 settings.quota_failover_retained_context_enabled
                 and rewritten_file_account_id is None
@@ -2404,8 +2425,16 @@ class _HTTPBridgeStreamingMixin:
                     quota_loss = not pre_submit_continuity_failure and await self._owner_selection_loss_is_quota_caused(
                         durable_lookup.account_id
                     )
+                    operator_pause = (
+                        not quota_loss
+                        and not pre_submit_continuity_failure
+                        and await self._owner_selection_loss_is_operator_paused(
+                            account_id=durable_lookup.account_id, api_key=api_key
+                        )
+                    )
                     tier_loss = (
                         not quota_loss
+                        and not operator_pause
                         and (owner_policy_conflict or pre_submit_continuity_failure)
                         and durable_lookup.model == payload.model
                         and await self._owner_selection_loss_is_service_tier_caused(
@@ -2415,13 +2444,18 @@ class _HTTPBridgeStreamingMixin:
                             api_key=api_key,
                         )
                     )
-                    if not quota_loss and not tier_loss:
+                    if not quota_loss and not operator_pause and not tier_loss:
                         if rejection is not None:
                             record_account_neutral_replay_rejection(rejection)
                         return False
                     durable_full_resend_fresh_payload = retained_payload
+                    recovery_event = "quota_owner_retained_context_replay"
+                    if operator_pause:
+                        recovery_event = "paused_owner_retained_context_replay"
+                    elif tier_loss:
+                        recovery_event = "tier_owner_retained_context_replay"
                     _log_http_bridge_event(
-                        "tier_owner_retained_context_replay" if tier_loss else "quota_owner_retained_context_replay",
+                        recovery_event,
                         bridge_session_key,
                         account_id=durable_lookup.account_id,
                         model=payload.model,

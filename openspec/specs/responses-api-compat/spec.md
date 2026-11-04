@@ -11009,7 +11009,7 @@ before removing an anchor. It MUST preserve all original input items, IDs,
 annotations and encrypted content in the replacement request. It MUST exclude
 the exhausted owner and use the existing fenced recovery and alias publication
 path. It MUST NOT replay a file-pinned request, a mismatched explicit anchor,
-unknown context shapes, or a request whose owner's quota status is unconfirmed unless the separate verified service-tier recovery requirement applies.
+unknown context shapes, or a request whose owner's quota status is unconfirmed unless the separate verified service-tier or operator-pause recovery requirement applies.
 The setting MUST default to false. Failure on the replacement account MUST NOT
 cause silent context removal or transcript modification.
 
@@ -11020,7 +11020,7 @@ cause silent context removal or transcript modification.
 - **AND** the old account and its session headers are excluded from recovery
 
 #### Scenario: Missing history or non-quota owner failure
-- **GIVEN** a resend omits prior output, references account-bound files, or the owner is paused or deactivated
+- **GIVEN** a resend omits prior output, references account-bound files, or the owner is deactivated
 - **WHEN** owner selection fails
 - **THEN** retained-context quota failover is refused
 
@@ -11044,7 +11044,7 @@ A compaction request with a proxy-synthesized turn-state MUST retain its resolve
 - **THEN** existing ownership conflict checks remain effective
 
 ### Requirement: Quota recovery handles catalog policy conflicts
-After 503 `continuity_owner_policy_conflict`, the HTTP bridge SHALL allow opt-in retained-context quota recovery only with a matching durable full-resend proof, persisted quota exhaustion, no input-file pin, and valid retained context. Replacement selection MUST enforce account eligibility and preserve complete input. Other policy failures MUST remain failures unless the separate verified service-tier recovery requirement applies.
+After 503 `continuity_owner_policy_conflict`, the HTTP bridge SHALL allow opt-in retained-context quota recovery only with a matching durable full-resend proof, persisted quota exhaustion, no input-file pin, and valid retained context. Replacement selection MUST enforce account eligibility and preserve complete input. Other policy failures MUST remain failures unless the separate verified service-tier or operator-pause recovery requirement applies.
 
 #### Scenario: Exhausted owner omitted from the catalog
 - **GIVEN** a verified full-history resend and a quota-exhausted durable owner
@@ -11052,7 +11052,7 @@ After 503 `continuity_owner_policy_conflict`, the HTTP bridge SHALL allow opt-in
 - **THEN** the bridge retries the intact history without the old anchor through eligible replacement selection
 
 #### Scenario: Policy rejection without quota evidence
-- **GIVEN** a policy-conflict rejection without persisted quota exhaustion or verified service-tier recovery eligibility
+- **GIVEN** a policy-conflict rejection without persisted quota exhaustion, verified service-tier eligibility, or verified operator-pause eligibility
 - **WHEN** recovery is evaluated
 - **THEN** the bridge preserves the failure and does not switch accounts
 
@@ -11067,3 +11067,20 @@ When retained-context recovery is enabled, the HTTP bridge SHALL permit an intac
 #### Scenario: Tier handoff cannot be proven
 - **WHEN** history is incomplete, a resource is owner-bound, the model changed, the owner is paused or outside the API-key scope, or catalog evidence is missing
 - **THEN** the proxy SHALL preserve the existing error and SHALL NOT authorize tier recovery
+
+### Requirement: Verified retained context can recover from an operator pause
+With retained-context recovery enabled, the HTTP bridge SHALL replay verified
+history after `previous_response_owner_unavailable` or `continuity_owner_policy_conflict`
+only for a fresh persisted paused owner in scope and not pending deletion.
+Existing history, anchor and resource checks MUST pass. Eligible replacement
+selection MUST exclude the owner and preserve input items and conversation files.
+The owner MUST remain paused.
+
+#### Scenario: Intentional switch away from the previous owner
+- **WHEN** a verified full-history resend belongs to a paused account and recovery is enabled
+- **THEN** the bridge SHALL select an eligible replacement and replay the complete input without the old anchor
+- **AND** the paused account SHALL remain paused
+
+#### Scenario: Pause recovery is unproven
+- **WHEN** history is incomplete, a resource is owner-bound, the owner is outside scope or pending deletion, the status lookup fails, or recovery is disabled
+- **THEN** the bridge SHALL preserve the existing error and SHALL NOT authorize pause recovery

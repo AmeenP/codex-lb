@@ -124,7 +124,7 @@ def test_retained_context_rejects_nonportable_or_unknown_state(desktop_payload, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("handoff", ["quota", "tier", "tier_model_change"])
+@pytest.mark.parametrize("handoff", ["quota", "pause", "tier", "tier_model_change"])
 @pytest.mark.parametrize("owner_error", ["unavailable", "policy_conflict", "pre_submit_continuity", "unrelated_503"])
 @pytest.mark.parametrize(
     "case", ["quota", "disabled", "non_quota", "missing_output", "changed_prefix", "file_pin", "wrong_anchor"]
@@ -136,7 +136,14 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
     async def repos():
         yield SimpleNamespace(
             accounts=SimpleNamespace(
-                get_by_id_fresh=AsyncMock(return_value=SimpleNamespace(status=AccountStatus.ACTIVE))
+                get_by_id_fresh=AsyncMock(
+                    return_value=SimpleNamespace(
+                        status=AccountStatus.PAUSED
+                        if handoff == "pause" and case != "non_quota"
+                        else AccountStatus.ACTIVE,
+                        delete_requested_at=None,
+                    )
+                )
             )
         )
 
@@ -244,7 +251,7 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
         case != "quota"
         or owner_error == "unrelated_503"
         or (handoff == "tier" and owner_error not in ("policy_conflict", "pre_submit_continuity"))
-        or (handoff == "quota" and owner_error == "pre_submit_continuity")
+        or (handoff in ("quota", "pause") and owner_error == "pre_submit_continuity")
         or handoff == "tier_model_change"
     ):
         with pytest.raises(ProxyResponseError):
@@ -266,6 +273,39 @@ async def test_bridge_quota_recovery_sends_intact_history_only_when_proven(
         quota_check.assert_not_awaited()
     else:
         quota_check.assert_awaited_once_with("exhausted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["paused", "in_scope", "out_of_scope", "deleted", "missing", "lookup_error", *AccountStatus]
+)
+async def test_pause_handoff_requires_persisted_scoped_operator_pause(case):
+    account = SimpleNamespace(
+        status=case if isinstance(case, AccountStatus) else AccountStatus.PAUSED,
+        delete_requested_at="pending" if case == "deleted" else None,
+    )
+    get = AsyncMock(
+        return_value=None if case == "missing" else account,
+        side_effect=RuntimeError("lookup failed") if case == "lookup_error" else None,
+    )
+
+    @asynccontextmanager
+    async def repos():
+        yield SimpleNamespace(accounts=SimpleNamespace(get_by_id_fresh=get))
+
+    api_key = None
+    if case in ("in_scope", "out_of_scope"):
+        api_key = SimpleNamespace(
+            account_assignment_scope_enabled=True,
+            assigned_account_ids=["owner", "replacement"] if case == "in_scope" else ["replacement"],
+        )
+    service = proxy_service.ProxyService(repos)
+    assert await service._owner_selection_loss_is_operator_paused(account_id="owner", api_key=api_key) == (
+        case in ("paused", "in_scope", AccountStatus.PAUSED)
+    )
+    assert account.status == (case if isinstance(case, AccountStatus) else AccountStatus.PAUSED)
+    if case == "out_of_scope":
+        get.assert_not_awaited()
 
 
 @pytest.mark.asyncio

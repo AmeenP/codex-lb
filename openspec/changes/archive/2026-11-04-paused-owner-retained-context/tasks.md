@@ -1,0 +1,4 @@
+- [x] Add scoped persisted-pause eligibility to retained-history HTTP recovery.
+- [x] Verify intact replay and refusal for incomplete history, files, disabled recovery, and unrelated errors.
+- [x] Validate specs and build the versioned fork wheel.
+- [x] Deploy to the affected machine and verify the original conversation handoff.
